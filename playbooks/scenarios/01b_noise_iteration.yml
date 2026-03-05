@@ -1,0 +1,95 @@
+# =============================================================================
+# MikroTik Noise Measurement Iteration (Phase 1)
+# =============================================================================
+
+- name: "S1b P1 - Iteration {{ iteration_num }}/{{ noise_test_iterations }} - Start"
+  ansible.builtin.debug:
+    msg: "Low-load iteration {{ iteration_num }} at {{ noise_test_rate_gbps }} Gbps..."
+
+# -------------------------------------------------------------------------
+# Start MikroTik Monitoring (Background)
+# -------------------------------------------------------------------------
+- name: "S1b P1 - Iteration {{ iteration_num }} - Start MikroTik monitoring"
+  ansible.builtin.shell: |
+    ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+    {{ playbook_dir }}/../utils/run_monitoring.yml \
+      -e "monitor_duration_sec={{ noise_test_duration_sec }}" \
+      -e "monitor_interval_sec={{ monitor_interval_sec }}" \
+      -e "monitor_start_delay_sec=5" \
+      -e "monitor_output_file={{ test_results_dir }}/s1b_phase1_{{ iteration_num }}_monitor.log" \
+      -e "ansible_host={{ dut_ansible_host }}" \
+      -e "ansible_user={{ dut_ansible_user }}" \
+      -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+      -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+      -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+  args:
+    # Pointing to your new MikroTik project directory
+    chdir: /opt/mikrotik-perf-validation 
+  async: "{{ (noise_test_duration_sec | int) + 60 }}"
+  poll: 0
+  register: monitor_job
+  become: false
+
+# -------------------------------------------------------------------------
+# Run T-Rex Traffic (Uses your new 02_trex_control role)
+# -------------------------------------------------------------------------
+- name: "S1b P1 - Iteration {{ iteration_num }} - Run T-Rex IMIX traffic"
+  ansible.builtin.include_role:
+    name: 02_trex_control
+    tasks_from: start_test.yml
+  vars:
+    traffic_profile_name: "imix"
+    duration: "{{ noise_test_duration_sec }}"
+    # Low-load rate to measure baseline noise
+    rate_gbps: "{{ noise_test_rate_gbps }}" 
+    profile_client_ip: "{{ trex_ip }}"
+    profile_server_ip: "{{ app_server_ip }}"
+    # Pointing to MikroTik ether2 IP (172.16.1.1)
+    profile_gateway_ip: "{{ dut_trex_lan_ip }}" 
+    results_file_name: "{{ test_results_dir }}/s1b_phase1_{{ iteration_num }}_trex.log"
+
+# -------------------------------------------------------------------------
+# 3. Wait for Monitoring to Complete
+# -------------------------------------------------------------------------
+- name: "S1b P1 - Iteration {{ iteration_num }} - Wait for monitoring to complete"
+  ansible.builtin.async_status:
+    jid: "{{ monitor_job.ansible_job_id }}"
+  register: monitor_result
+  until: monitor_result.finished
+  retries: 30
+  delay: 5
+  become: false
+
+# -------------------------------------------------------------------------
+# 4. Parse T-Rex Results (Extracts RX/TX from log)
+# -------------------------------------------------------------------------
+- name: "S1b P1 - Iteration {{ iteration_num }} - Read T-Rex log"
+  ansible.builtin.slurp:
+    src: "{{ test_results_dir }}/s1b_phase1_{{ iteration_num }}_trex.log"
+  register: trex_log_content
+  delegate_to: localhost
+
+- name: "S1b P1 - Iteration {{ iteration_num }} - Parse results"
+  vars:
+    trex_log: "{{ trex_log_content.content | b64decode }}"
+    opackets_match: "{{ trex_log | regex_search('opackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+    ipackets_match: "{{ trex_log | regex_search('ipackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+  ansible.builtin.set_fact:
+    iter_opackets: "{{ opackets_match[0] | default('0') | int }}"
+    iter_ipackets: "{{ ipackets_match[0] | default('0') | int }}"
+
+- name: "S1b P1 - Iteration {{ iteration_num }} - Calculate loss"
+  ansible.builtin.set_fact:
+    iter_loss_pct: "{{ (((iter_opackets | int - iter_ipackets | int) / (iter_opackets | int)) * 100) if (iter_opackets | int) > 0 else 100.0 }}"
+
+# -------------------------------------------------------------------------
+# 5. Store & Pause
+# -------------------------------------------------------------------------
+- name: "S1b P1 - Iteration {{ iteration_num }} - Store iteration result"
+  ansible.builtin.set_fact:
+    phase1_results: "{{ phase1_results + [{'iteration': iteration_num, 'tx_pkts': iter_opackets | int, 'rx_pkts': iter_ipackets | int, 'loss_pct': iter_loss_pct | float, 'rate_gbps': noise_test_rate_gbps}] }}"
+
+- name: "S1b P1 - Iteration {{ iteration_num }} - Pause before next iteration"
+  ansible.builtin.pause:
+    seconds: 10
+  when: iteration_num | int < noise_test_iterations | int

@@ -1,0 +1,134 @@
+# ASTF profile for session ramp test
+# Scalability Strategy:
+# - Uses a small, fixed number of Source IPs (to avoid DUT ARP table exhaustion)
+# - Relies on T-Rex DEFAULT Port generation (Client: Ephemeral Random, Server: 80)
+# - Includes robust import logic for ASTFCPSProfile to fix NameError.
+
+from trex.astf.api import *
+import sys
+
+# [FIX] Explicitly try to import ASTFCPSProfile if not in 'api'
+try:
+    from trex.astf.trex_astf_profile import ASTFCPSProfile
+except ImportError:
+    try:
+        # Fallback for some older/different structures
+        from trex.astf.api import ASTFCPSProfile
+    except ImportError:
+        ASTFCPSProfile = None
+
+
+class Prof1:
+    def __init__(self):
+        pass
+
+    def get_profile(self, tunables=None, **kwargs):
+        # ----------------------------------------------------------------
+        # 1. Configuration via Jinja2
+        # ----------------------------------------------------------------
+        client_ip_start = "{{ profile_client_ip_start | default('172.16.1.2') }}"
+        client_ip_end   = "{{ profile_client_ip_end | default('172.16.1.50') }}"
+
+        # NEW: allow a server IP *range* so we can satisfy DP-threads>=2
+        server_ip_start = "{{ profile_server_ip_start | default('10.0.0.2') }}"
+        server_ip_end   = "{{ profile_server_ip_end | default('10.0.0.3') }}"
+
+        # Test Parameters
+        target_max_cps = {{ session_max_cps | default(10000) }}
+        ramp_time_sec  = {{ duration | default(600) }}
+
+        # Session Hold Time (usec) - Default is 5 seconds
+        session_delay_usec = {{ session_delay_usec | default(5000000) }}
+
+        # ----------------------------------------------------------------
+        # 2. IP Generators
+        # ----------------------------------------------------------------
+        # Client IP: Small range (49 IPs), Sequential distribution
+        ip_gen_c = ASTFIPGenDist(
+            ip_range=[client_ip_start, client_ip_end],
+            distribution="seq",
+        )
+
+        # Server IP: now a *range* with at least 2 addresses
+        ip_gen_s = ASTFIPGenDist(
+            ip_range=[server_ip_start, server_ip_end],
+            distribution="seq",
+        )
+
+        # Uses default port generation (Client: Random 1024-65535, Server: 80)
+        ip_gen = ASTFIPGen(
+            dist_client=ip_gen_c,
+            dist_server=ip_gen_s,
+        )
+
+        # ----------------------------------------------------------------
+        # 3. Application Protocol (client + minimal server)
+        # ----------------------------------------------------------------
+        http_prog_c = ASTFProgram()
+        http_prog_c.send(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: 10.0.0.2\r\n'   # Host header can stay fixed; server won’t care
+            b'\r\n'
+        )
+        http_prog_c.recv(10)
+
+        # Wait for the hold time
+        http_prog_c.delay(session_delay_usec)
+
+        # Force TCP Reset (RST)
+        # This forces the DUT to clear the session immediately from its table,
+        # preventing 'Time-Wait' pile-up which causes session counts to balloon.
+        http_prog_c.reset()
+
+        http_prog_s = ASTFProgram()
+        http_prog_s.recv(1)
+        http_prog_s.send(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Length: 10\r\n"
+            b"\r\n"
+            b"0123456789"
+        )
+        # Server also resets to be sure
+        http_prog_s.wait_for_peer_close()
+
+        # ----------------------------------------------------------------
+        # 4. Templates (client + server)
+        # ----------------------------------------------------------------
+        temp_c = ASTFTCPClientTemplate(
+            program=http_prog_c,
+            ip_gen=ip_gen,
+            cps=target_max_cps,
+        )
+
+        temp_s = ASTFTCPServerTemplate(
+            program=http_prog_s,
+            assoc=ASTFAssociationRule(port=80),
+        )
+
+        template = ASTFTemplate(
+            client_template=temp_c,
+            server_template=temp_s,
+        )
+
+        # ----------------------------------------------------------------
+        # 5. Global Ramp Logic (CPS ramp-up)
+        # ----------------------------------------------------------------
+        c_glob_info = ASTFGlobalInfo()
+        c_glob_info.scheduler.rampup_sec = int(ramp_time_sec / 2)
+
+        s_glob_info = ASTFGlobalInfo()
+
+        # ----------------------------------------------------------------
+        # 6. Profile Construction
+        # ----------------------------------------------------------------
+        profile = ASTFProfile(
+            default_ip_gen=ip_gen,
+            templates=template,
+            default_c_glob_info=c_glob_info,
+            default_s_glob_info=s_glob_info,
+        )
+        return profile
+
+
+def register():
+    return Prof1()

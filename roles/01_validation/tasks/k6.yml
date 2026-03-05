@@ -1,0 +1,41 @@
+- name: 3.1 - Check K6 binary
+  ansible.builtin.stat:
+    path: "{{ k6_binary_path }}"
+  register: k6_binary
+
+- name: 3.2 - Fail if K6 binary is missing
+  ansible.builtin.fail:
+    msg: "K6 binary not found at {{ k6_binary_path }}. Please run Configuration_Guide_v2.md."
+  when: not k6_binary.stat.exists
+
+- name: 3.3 - Check K6 test interface (VLAN 203)
+  ansible.builtin.command: "ip route get {{ app_server_ip }}"
+  register: k6_route
+  changed_when: false
+
+- name: 3.4 - Fail if K6 route is not via DUT ether3 (172.16.0.1)
+  ansible.builtin.fail:
+    msg: "K6 routing is incorrect. Route to {{ app_server_ip }} is not via 172.16.0.1. {{ k6_route.stdout }}. Please run Configuration Guide.md."
+  when: "not ( k6_route.stdout is search('10.0.0.2 via 172.16.0.1'))"
+
+- name: 3.5 - Check K6 connectivity to DUT ether3 (Gateway)
+  ansible.builtin.command: "ping -c 4 172.16.0.1"
+  changed_when: false
+  failed_when: false # We check the result in the next task
+  register: ping_gw
+
+- name: 3.6 - Fail if K6 cannot ping its gateway
+  ansible.builtin.fail:
+    msg: "K6 server (172.16.0.2) cannot ping its gateway (172.16.0.1). Check cabling and DUT ether3  config."
+  when: "ping_gw.rc != 0"
+
+- name: 3.7 - Check K6 connectivity to App Server (through DUT)
+  ansible.builtin.command: "ping -c 4 {{ app_server_ip }}"
+  changed_when: false
+  failed_when: false
+  register: ping_app
+
+- name: 3.8 - Fail if K6 cannot ping the App Server
+  ansible.builtin.fail:
+    msg: "K6 server (172.16.0.2) cannot ping the App Server ({{ app_server_ip }}). Check DUT-Ciso Sw Vlans and routing."
+  when: "ping_app.rc != 0"

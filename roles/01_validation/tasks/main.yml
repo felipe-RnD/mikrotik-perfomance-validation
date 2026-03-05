@@ -1,0 +1,32 @@
+# This file contains all the validation tasks moved from the playbook
+# to make the framework modular.
+
+- name: 1.1 - Check Ansible connectivity
+  ansible.builtin.ping:
+  tags: [always, validate]
+
+- name: 1.2 - Check OS and kernel versions
+  ansible.builtin.debug:
+    msg: "Host {{ inventory_hostname }} is running {{ ansible_distribution }} {{ ansible_distribution_version }} with kernel {{ ansible_kernel }}"
+  when: ansible_distribution is defined
+  tags: [always, validate]
+
+- name: 1.3 - Run validation tasks on T-Rex server
+  ansible.builtin.include_tasks: trex.yml
+  when: "inventory_hostname in groups['trex_server']"
+  tags: [validate]
+
+- name: 1.4 - Run validation tasks on K6 server
+  ansible.builtin.include_tasks: k6.yml
+  when: "inventory_hostname in groups['k6_server']"
+  tags: [validate]
+
+- name: 1.5 - Run validation tasks on App server
+  ansible.builtin.include_tasks: app_server.yml
+  when: "inventory_hostname in groups['app_server']"
+  tags: [validate]
+
+- name: 1.6 - Run validation tasks on Mikrotik devices
+  ansible.builtin.include_tasks: mikrotik.yml
+  when: inventory_hostname in groups['mikrotik_dut']
+  tags: [validate]

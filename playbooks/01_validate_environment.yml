@@ -1,0 +1,15 @@
+- name: 01 - Validate Test Environment
+  hosts: all
+  gather_facts: no
+  
+  pre_tasks:
+    - name: Debug - Show group membership
+      debug:
+        msg: "Host {{ inventory_hostname }} is in groups: {{ group_names }}"
+    
+    - name: Gather facts from non-Mikrotik devices
+      setup:
+      when: "'mikrotik_devices' not in group_names"
+  
+  roles:
+    - 01_validation

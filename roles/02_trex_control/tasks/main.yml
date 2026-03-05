@@ -1,0 +1,5 @@
+# This file is intentionally blank.
+# Logic is called directly from other playbooks using:
+# include_role:
+#   name: 02_trex_control
+#   tasks_from: binary_search.yml

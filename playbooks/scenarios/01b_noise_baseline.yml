@@ -1,0 +1,461 @@
+# =============================================================================
+# Scenario 01b - Baseline Noise Characterization (v2.1)
+# =============================================================================
+# Purpose: Measures inherent packet loss from virtio/virtualization overhead
+#          and quantifies the "observer effect" from DUT monitoring at load.
+#
+# Phases:
+#   1. Low Load Baseline    - Wire noise at 100 Mbps IMIX
+#   2. Hardware Ceiling     - Find max sustainable rate (binary search)
+#   3. Stress Calibration   - Multiple samples at 80% load with monitoring
+#   4. Observer Isolation   - Compare monitoring ON vs OFF (optional)
+#
+# Output: s1b_noise_baseline.json with calibrated threshold recommendations
+# =============================================================================
+
+- name: Scenario 01b - Baseline Noise Characterization
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+
+  vars:
+    # --- Phase 1 Parameters (Low Load) ---
+    noise_test_rate_gbps: 0.1          # 100 Mbps - Safe baseline for 10G link
+    noise_test_duration_sec: 60        # Duration per iteration
+    noise_test_iterations: 8           # Number of runs for statistics
+    monitor_interval_sec: 10           # DUT monitoring interval
+
+    # --- Phase 2 Parameters (Hardware Ceiling) ---
+    ceiling_profile: "l3_64b"          # 64b stresses PPS the most
+    ceiling_search_max_gbps: 0.5       # Upper bound for search
+    ceiling_loss_threshold: 0.001      # 0.1% - strict for finding true ceiling
+    ceiling_search_duration_sec: 30    # Per-iteration duration
+
+    # --- Phase 3 Parameters (Stress Calibration) ---
+    stress_load_factor: 0.80           # Run at 80% of ceiling to measure stability
+    stress_iterations: 8               # Multiple samples for statistics
+    stress_duration_sec: 60            # Duration per stress sample
+
+    # --- Phase 4 Parameters (Observer Isolation - Optional) ---
+    run_observer_isolation: true       # Set false to skip Phase 4
+    observer_iterations: 3             # Samples for each condition
+
+    # ITU-T Y.1564 baseline threshold
+    itu_baseline_pct: 0.1
+
+    # Results directory
+    results_dir_base: "{{ playbook_dir }}/../../results"
+
+  pre_tasks:
+    # -------------------------------------------------------------------------
+    # Setup and Variable Loading
+    # -------------------------------------------------------------------------
+    - name: S1b - Gather facts for timestamps
+      ansible.builtin.setup:
+        gather_subset:
+          - '!all'
+          - 'date_time'
+
+    - name: S1b - Set results directory
+      ansible.builtin.set_fact:
+        test_results_dir: "{{ results_dir_base }}/noise_baseline_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: S1b - Create results directory
+      ansible.builtin.file:
+        path: "{{ test_results_dir }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+    - name: S1b - Load T-Rex defaults
+      ansible.builtin.include_vars:
+        file: "../../inventory/group_vars/trex_server.yml"
+        name: trex_defaults
+
+    - name: S1b - Identify DUT hostname
+      ansible.builtin.set_fact:
+        dut_hostname: "{{ groups['mikrotik_dut'][0] }}"
+
+    - name: S1b - Load DUT host variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    - name: S1b - Load platform variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ platform_name }}.yml"
+      ignore_errors: yes
+
+    - name: S1b - Set DUT connection variables
+      ansible.builtin.set_fact:
+        dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
+        trex_ip: "{{ hostvars[groups['trex_server'][0]]['trex_ip'] }}"
+        app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+        app_server_base_if: "{{ hostvars[groups['app_server'][0]]['app_server_base_if'] }}"
+        trex_install_dir: "{{ trex_defaults['trex_install_dir'] }}"
+
+    - name: S1b - Initialize results storage
+      ansible.builtin.set_fact:
+        phase1_results: []
+        phase3_results: []
+        phase4_monitor_on_results: []
+        phase4_monitor_off_results: []
+
+    - name: S1b - Display test parameters
+      ansible.builtin.debug:
+        msg:
+          - "===================================================================="
+          - "  SCENARIO 01b - NOISE BASELINE CHARACTERIZATION v2.1"
+          - "===================================================================="
+          - "Phase 1: Low Load Baseline"
+          - "  - Rate: {{ noise_test_rate_gbps }} Gbps, Iterations: {{ noise_test_iterations }}"
+          - "Phase 2: Hardware Ceiling Discovery"
+          - "  - Profile: {{ ceiling_profile }}, Max: {{ ceiling_search_max_gbps }} Gbps"
+          - "Phase 3: Stress Calibration"
+          - "  - Load: {{ (stress_load_factor * 100) | int }}% of ceiling, Iterations: {{ stress_iterations }}"
+          - "Phase 4: Observer Isolation"
+          - "  - Enabled: {{ run_observer_isolation }}, Iterations: {{ observer_iterations }}"
+          - "===================================================================="
+
+    # -------------------------------------------------------------------------
+    # XDP Reflector Setup
+    # -------------------------------------------------------------------------
+    - name: S1b - Check if XDP reflector binary exists
+      ansible.builtin.stat:
+        path: /opt/scripts/xdp_loader
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: xdp_binary
+
+    - name: S1b - Fail if XDP reflector not found
+      ansible.builtin.fail:
+        msg: "XDP reflector not found at /opt/scripts/xdp_loader. Please compile it first."
+      when: not xdp_binary.stat.exists
+
+    - name: S1b - Kill any existing XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off || true"
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S1b - Start XDP reflector
+      ansible.builtin.shell: |
+        nohup sudo /opt/scripts/xdp_loader -i {{ app_server_base_if }} > /tmp/xdp_reflect.log 2>&1 &
+      args:
+        chdir: /opt/scripts
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S1b - Wait for XDP reflector to initialize
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: S1b - Verify XDP reflector is ATTACHED
+      ansible.builtin.shell: "ip link show dev {{ app_server_base_if }}"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: ip_link_output
+      until: ip_link_output.stdout is defined and ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)')
+      retries: 3
+      delay: 2
+      failed_when: not (ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)'))
+
+    - name: S1b - Test connectivity after XDP reflector loaded
+      ansible.builtin.shell: "ping -c 3 -W 2 {{ app_server_ip }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: ping_app_from_trex
+      failed_when: false
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: LOW LOAD BASELINE
+    # =========================================================================
+    - name: S1b - Phase 1 Banner
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "+------------------------------------------------------------------+"
+          - "|  PHASE 1: LOW LOAD BASELINE (Wire Noise)                        |"
+          - "+------------------------------------------------------------------+"
+
+    - name: S1b - Run Phase 1 iterations
+      ansible.builtin.include_tasks: 01b_noise_iteration.yml
+      loop: "{{ range(1, noise_test_iterations | int + 1) | list }}"
+      loop_control:
+        loop_var: iteration_num
+      vars:
+        current_phase: 1
+        iteration_results_var: "phase1_results"
+
+    # --- Phase 1 Statistics ---
+    - name: S1b - Extract Phase 1 loss values
+      ansible.builtin.set_fact:
+        phase1_losses: "{{ phase1_results | map(attribute='loss_pct') | list }}"
+
+    - name: S1b - Calculate Phase 1 statistics
+      ansible.builtin.set_fact:
+        phase1_avg: "{{ (phase1_losses | map('float') | sum) / (phase1_losses | length) }}"
+        phase1_max: "{{ phase1_losses | map('float') | max }}"
+        phase1_min: "{{ phase1_losses | map('float') | min }}"
+
+    - name: S1b - Calculate Phase 1 stddev
+      vars:
+        mean: "{{ phase1_avg | float }}"
+        squared_diffs: "{{ phase1_losses | map('float') | map('pow', 2) | sum - ((phase1_losses | map('float') | sum) ** 2 / (phase1_losses | length)) }}"
+      ansible.builtin.set_fact:
+        phase1_stddev: "{{ ((squared_diffs | float | abs) / (phase1_losses | length)) ** 0.5 }}"
+
+    - name: S1b - Phase 1 Summary
+      ansible.builtin.debug:
+        msg:
+          - "Phase 1 Results:"
+          - "  Samples: {{ phase1_losses | map('round', 4) | list }}"
+          - "  Average: {{ phase1_avg | float | round(4) }}%"
+          - "  StdDev:  {{ phase1_stddev | float | round(4) }}%"
+          - "  Range:   {{ phase1_min | float | round(4) }}% - {{ phase1_max | float | round(4) }}%"
+
+    # =========================================================================
+    # PHASE 2: HARDWARE CEILING DISCOVERY
+    # =========================================================================
+    - name: S1b - Phase 2 Banner
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "+------------------------------------------------------------------+"
+          - "|  PHASE 2: HARDWARE CEILING DISCOVERY                            |"
+          - "+------------------------------------------------------------------+"
+
+    - name: S1b - Find hardware ceiling (binary search)
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "{{ ceiling_profile }}"
+        binary_search_max_gbps: "{{ ceiling_search_max_gbps }}"
+        binary_search_loss_pct: "{{ ceiling_loss_threshold }}"
+        binary_search_duration_sec: "{{ ceiling_search_duration_sec }}"
+        binary_search_min_gbps: 0.001
+        binary_search_resolution_gbps: 0.001
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        # Use multi-sample for noisy environments
+        samples_per_rate: 4
+        sample_duration_sec: 30
+        warmup_duration_sec: 5
+
+    - name: S1b - Store hardware ceiling
+      ansible.builtin.set_fact:
+        hardware_ceiling_gbps: "{{ gbps }}"
+        stress_target_gbps: "{{ (gbps | float * stress_load_factor) | round(3) }}"
+
+    - name: S1b - Phase 2 Summary
+      ansible.builtin.debug:
+        msg:
+          - "Phase 2 Results:"
+          - "  Hardware Ceiling: {{ hardware_ceiling_gbps }} Gbps"
+          - "  Stress Target ({{ (stress_load_factor * 100) | int }}%): {{ stress_target_gbps }} Gbps"
+
+    # =========================================================================
+    # PHASE 3: STRESS CALIBRATION (Multiple Samples at Load)
+    # =========================================================================
+    - name: S1b - Phase 3 Banner
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "+------------------------------------------------------------------+"
+          - "|  PHASE 3: STRESS CALIBRATION (Observer Effect at Load)          |"
+          - "+------------------------------------------------------------------+"
+
+    - name: S1b - Run Phase 3 stress iterations
+      ansible.builtin.include_tasks: 01b_stress_iteration.yml
+      loop: "{{ range(1, stress_iterations | int + 1) | list }}"
+      loop_control:
+        loop_var: stress_iter_num
+      vars:
+        stress_rate: "{{ stress_target_gbps }}"
+        stress_duration: "{{ stress_duration_sec }}"
+        enable_monitoring: true
+
+    # --- Phase 3 Statistics ---
+    - name: S1b - Extract Phase 3 loss values
+      ansible.builtin.set_fact:
+        phase3_losses: "{{ phase3_results | map(attribute='loss_pct') | list }}"
+
+    - name: S1b - Calculate Phase 3 statistics
+      ansible.builtin.set_fact:
+        phase3_avg: "{{ (phase3_losses | map('float') | sum) / (phase3_losses | length) }}"
+        phase3_max: "{{ phase3_losses | map('float') | max }}"
+        phase3_min: "{{ phase3_losses | map('float') | min }}"
+
+    - name: S1b - Calculate Phase 3 stddev
+      vars:
+        squared_diffs: "{{ phase3_losses | map('float') | map('pow', 2) | sum - ((phase3_losses | map('float') | sum) ** 2 / (phase3_losses | length)) }}"
+      ansible.builtin.set_fact:
+        phase3_stddev: "{{ ((squared_diffs | float | abs) / (phase3_losses | length)) ** 0.5 }}"
+
+    - name: S1b - Phase 3 Summary
+      ansible.builtin.debug:
+        msg:
+          - "Phase 3 Results (WITH Monitoring):"
+          - "  Rate: {{ stress_target_gbps }} Gbps"
+          - "  Samples: {{ phase3_losses | map('round', 4) | list }}"
+          - "  Average: {{ phase3_avg | float | round(4) }}%"
+          - "  StdDev:  {{ phase3_stddev | float | round(4) }}%"
+          - "  Range:   {{ phase3_min | float | round(4) }}% - {{ phase3_max | float | round(4) }}%"
+
+    # =========================================================================
+    # PHASE 4: OBSERVER ISOLATION (Optional - Compare Monitoring ON vs OFF)
+    # =========================================================================
+    - name: S1b - Phase 4 Block
+      when: run_observer_isolation | bool
+      block:
+        - name: S1b - Phase 4 Banner
+          ansible.builtin.debug:
+            msg:
+              - ""
+              - "+------------------------------------------------------------------+"
+              - "|  PHASE 4: OBSERVER ISOLATION (Monitoring Impact)                |"
+              - "+------------------------------------------------------------------+"
+
+        # --- Phase 4a: WITH Monitoring ---
+        - name: S1b - Phase 4a - Run WITH monitoring
+          ansible.builtin.include_tasks: 01b_observer_iteration.yml
+          loop: "{{ range(1, observer_iterations | int + 1) | list }}"
+          loop_control:
+            loop_var: observer_iter_num
+          vars:
+            observer_rate: "{{ stress_target_gbps }}"
+            observer_duration: "{{ stress_duration_sec }}"
+            monitoring_enabled: true
+            results_list_var: "phase4_monitor_on_results"
+
+        # --- Phase 4b: WITHOUT Monitoring ---
+        - name: S1b - Phase 4b - Run WITHOUT monitoring
+          ansible.builtin.include_tasks: 01b_observer_iteration.yml
+          loop: "{{ range(1, observer_iterations | int + 1) | list }}"
+          loop_control:
+            loop_var: observer_iter_num
+          vars:
+            observer_rate: "{{ stress_target_gbps }}"
+            observer_duration: "{{ stress_duration_sec }}"
+            monitoring_enabled: false
+            results_list_var: "phase4_monitor_off_results"
+
+        # --- Phase 4 Statistics ---
+        - name: S1b - Calculate Phase 4 statistics
+          ansible.builtin.set_fact:
+            phase4_on_losses: "{{ phase4_monitor_on_results | map(attribute='loss_pct') | list }}"
+            phase4_off_losses: "{{ phase4_monitor_off_results | map(attribute='loss_pct') | list }}"
+
+        - name: S1b - Calculate Phase 4 averages
+          ansible.builtin.set_fact:
+            phase4_on_avg: "{{ (phase4_on_losses | map('float') | sum) / (phase4_on_losses | length) }}"
+            phase4_off_avg: "{{ (phase4_off_losses | map('float') | sum) / (phase4_off_losses | length) }}"
+
+        - name: S1b - Calculate monitoring overhead
+          ansible.builtin.set_fact:
+            monitoring_overhead_pct: "{{ (phase4_on_avg | float) - (phase4_off_avg | float) }}"
+
+        - name: S1b - Phase 4 Summary
+          ansible.builtin.debug:
+            msg:
+              - "Phase 4 Results:"
+              - "  WITH Monitoring:    {{ phase4_on_losses | map('round', 4) | list }} -> Avg: {{ phase4_on_avg | float | round(4) }}%"
+              - "  WITHOUT Monitoring: {{ phase4_off_losses | map('round', 4) | list }} -> Avg: {{ phase4_off_avg | float | round(4) }}%"
+              - "  Monitoring Overhead: {{ monitoring_overhead_pct | float | round(4) }}%"
+
+    - name: S1b - Set defaults if Phase 4 skipped
+      when: not (run_observer_isolation | bool)
+      ansible.builtin.set_fact:
+        phase4_on_avg: "{{ phase3_avg }}"
+        phase4_off_avg: "{{ phase3_avg }}"
+        monitoring_overhead_pct: 0
+        phase4_on_losses: []
+        phase4_off_losses: []
+
+    # =========================================================================
+    # SAVE RESULTS
+    # =========================================================================
+    - name: S1b - Save comprehensive results
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "01b_noise_baseline",
+            "version": "2.0",
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "test_parameters": {
+              "phase1_rate_gbps": {{ noise_test_rate_gbps }},
+              "phase1_duration_sec": {{ noise_test_duration_sec }},
+              "phase1_iterations": {{ noise_test_iterations }},
+              "stress_load_factor": {{ stress_load_factor }},
+              "stress_iterations": {{ stress_iterations }},
+              "stress_duration_sec": {{ stress_duration_sec }},
+              "observer_isolation_enabled": {{ run_observer_isolation | lower }}
+            },
+            "phase1_low_load": {
+              "iterations": {{ phase1_results | to_json }},
+              "statistics": {
+                "avg_loss_pct": {{ phase1_avg | float | round(6) }},
+                "max_loss_pct": {{ phase1_max | float | round(6) }},
+                "min_loss_pct": {{ phase1_min | float | round(6) }},
+                "stddev": {{ phase1_stddev | float | round(6) }}
+              }
+            },
+            "phase2_hardware_ceiling": {
+              "profile": "{{ ceiling_profile }}",
+              "ceiling_gbps": {{ hardware_ceiling_gbps }},
+              "stress_target_gbps": {{ stress_target_gbps }}
+            },
+            "phase3_stress_calibration": {
+              "iterations": {{ phase3_results | to_json }},
+              "statistics": {
+                "avg_loss_pct": {{ phase3_avg | float | round(6) }},
+                "max_loss_pct": {{ phase3_max | float | round(6) }},
+                "min_loss_pct": {{ phase3_min | float | round(6) }},
+                "stddev": {{ phase3_stddev | float | round(6) }}
+              }
+            },
+            "phase4_observer_isolation": {
+              "enabled": {{ run_observer_isolation | lower }},
+              "monitor_on_iterations": {{ phase4_monitor_on_results | default([]) | to_json }},
+              "monitor_off_iterations": {{ phase4_monitor_off_results | default([]) | to_json }},
+              "monitor_on_avg_loss_pct": {{ phase4_on_avg | float | round(6) }},
+              "monitor_off_avg_loss_pct": {{ phase4_off_avg | float | round(6) }},
+              "monitoring_overhead_pct": {{ monitoring_overhead_pct | float | round(6) }}
+            },
+            "itu_baseline": {
+              "threshold_pct": {{ itu_baseline_pct }}
+            }
+          }
+        dest: "{{ test_results_dir }}/s1b_noise_baseline.json"
+        mode: '0644'
+
+    # =========================================================================
+    # ANALYSIS AND RECOMMENDATIONS
+    # =========================================================================
+    - name: S1b - Run analysis parser
+      ansible.builtin.command:
+        cmd: "python3 {{ playbook_dir }}/../../scripts/analysis/parse_s01b_results.py {{ test_results_dir }}"
+      register: parser_out
+
+    - name: S1b - Display Results
+      ansible.builtin.debug:
+        msg: "{{ parser_out.stdout_lines }}"
+
+  post_tasks:
+    # -------------------------------------------------------------------------
+    # Cleanup
+    # -------------------------------------------------------------------------
+    - name: S1b - Detach XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      changed_when: false
+      failed_when: false
+
+    - name: S1b - Verify connectivity after XDP shutdown
+      ansible.builtin.shell: "ping -c 3 {{ app_server_ip }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: final_ping
+      failed_when: false
+
+    - name: S1b - Display final connectivity status
+      ansible.builtin.debug:
+        msg: "Connectivity after XDP reflector shutdown: {{ 'OK' if final_ping.rc == 0 else 'CHECK MANUALLY' }}"

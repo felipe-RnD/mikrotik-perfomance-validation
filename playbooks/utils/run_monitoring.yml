@@ -1,0 +1,8 @@
+- name: Monitoring Wrapper
+  hosts: dut
+  gather_facts: no
+  tasks:
+    - name: Run monitoring loop
+      ansible.builtin.include_role:
+        name: 03_dut_control
+        tasks_from: monitor_stats_loop.yml

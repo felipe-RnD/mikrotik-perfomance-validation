@@ -1,0 +1,230 @@
+# -----------------------------------------------------------------
+# Service Selection & Switching Logic
+# -----------------------------------------------------------------
+- name: Determine required T-Rex service mode (ASTF vs STL)
+  ansible.builtin.set_fact:
+    target_service: "{{ 'trex-astf' if 'session' in traffic_profile_name else 'trex' }}"
+    conflicting_service: "{{ 'trex' if 'session' in traffic_profile_name else 'trex-astf' }}"
+
+- name: Determine start command flags and units
+  ansible.builtin.set_fact:
+    # ASTF: Does not support --force. Uses raw multiplier (no unit).
+    # STL: Needs --force. Needs 'gbps' unit for rate.
+    start_flags: "{{ '' if 'session' in traffic_profile_name else '--force' }}"
+    rate_unit: "{{ '' if 'session' in traffic_profile_name else 'gbps' }}"
+
+# Explicitly stop the conflicting service if it is running
+- name: Check if conflicting service is running
+  ansible.builtin.systemd:
+    name: "{{ conflicting_service }}"
+  register: conflicting_service_status
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
+
+- name: Stop conflicting T-Rex service ({{ conflicting_service }})
+  ansible.builtin.systemd:
+    name: "{{ conflicting_service }}"
+    state: stopped
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  when: conflicting_service_status.status.ActiveState == 'active'
+  ignore_errors: yes
+
+# Add cool-down buffer if we just stopped a service
+- name: Wait for service resource release (DPDK Cool-down)
+  ansible.builtin.pause:
+    seconds: 10
+  when: conflicting_service_status.status.ActiveState == 'active'
+
+# Now safe to start the target service
+- name: Ensure correct T-Rex service is started ({{ target_service }})
+  ansible.builtin.systemd:
+    name: "{{ target_service }}"
+    state: started
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  register: trex_service_status
+
+- name: Wait for T-Rex initialization
+  ansible.builtin.pause:
+    seconds: 5
+  when: trex_service_status.changed
+
+- name: Wait for T-Rex RPC port to be ready
+  ansible.builtin.wait_for:
+    port: 4501
+    host: "127.0.0.1"
+    delay: 5
+    timeout: 60
+  delegate_to: "{{ groups['trex_server'][0] }}"
+
+# -----------------------------------------------------------------
+# Profile Generation & Execution
+# -----------------------------------------------------------------
+
+- name: Generate T-Rex profile from template
+  ansible.builtin.template:
+    src: >-
+      templates/{{
+        'session_ramp_profile.py.j2' if 'session' in traffic_profile_name else
+        'l3_profile.py.j2' if 'l3' in traffic_profile_name else
+        'imix_profile.py.j2'
+      }}
+    dest: "/tmp/{{ traffic_profile_name }}.py"
+  vars:
+    # Handle 'large' label specially - use passed variable, otherwise extract from name
+    packet_size: >-
+      {%- if 'large' in traffic_profile_name -%}
+        {{ large_packet_size | default(1360) }}
+      {%- elif 'l3' in traffic_profile_name -%}
+        {{ traffic_profile_name.split('_')[-1][:-1] }}
+      {%- else -%}
+        64
+      {%- endif -%}
+  delegate_to: localhost
+
+- name: Copy T-Rex profile to T-Rex server
+  ansible.builtin.copy:
+    src: "/tmp/{{ traffic_profile_name }}.py"
+    dest: "{{ trex_install_dir }}/{{ traffic_profile_name }}.py"
+    mode: '0755'
+  delegate_to: "{{ groups['trex_server'][0] }}"
+
+# --- CREATE EXPECT SCRIPT AS FILE ---
+- name: Create expect script for validation test
+  ansible.builtin.copy:
+    dest: "/tmp/trex_start_test.exp"
+    content: |
+      #!/usr/bin/expect -f
+      set timeout {{ duration | int + 30 }}
+      log_user 1
+
+      # Change to T-Rex directory and start console
+      cd {{ trex_install_dir }}
+
+      # Use --force to acquire lock from zombies/previous runs
+      spawn ./trex-console --force
+
+      expect {
+        "trex>" {}
+        timeout {
+            puts "TIMEOUT waiting for initial prompt. Buffer content:"
+            puts "$expect_out(buffer)"
+            exit 1
+        }
+        eof {
+            puts "PROCESS DIED EARLY. Buffer content:"
+            puts "$expect_out(buffer)"
+            exit 1
+        }
+      }
+
+      # Reset ports
+      send "reset\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after reset"; exit 1 }
+      }
+
+      # Enable promiscuous mode
+      send "portattr -a --prom on\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after portattr"; exit 1 }
+      }
+
+      {% if 'session' in traffic_profile_name %}
+      # ASTF specific: Enable Service Mode explicitly before test
+      send "service -p 0\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT setting service mode"; exit 1 }
+      }
+      {% endif %}
+
+      # Start test
+      # We append rate_unit (e.g., 'gbps') for STL tests, and leave it empty for ASTF
+      puts "Starting test..."
+      send "start -f {{ trex_install_dir }}/{{ traffic_profile_name }}.py -m {{ rate_gbps }}{{ rate_unit }} {{ start_flags }}\r"
+
+      expect {
+        "trex>" {}
+        timeout {
+            puts "TIMEOUT after start command. Buffer content:"
+            puts "$expect_out(buffer)"
+            exit 1
+        }
+      }
+
+      puts "Running test for {{ duration }} seconds..."
+      sleep {{ duration }}
+
+      puts "Stopping test..."
+      send "stop\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after stop"; exit 1 }
+      }
+
+      send "stats -a\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after stats"; exit 1 }
+      }
+
+      {% if 'session' in traffic_profile_name %}
+      # ASTF specific: Disable Service Mode
+      send "service --off -p 0\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT disabling service mode"; exit 1 }
+      }
+      {% endif %}
+
+      # 'quit' releases the lock automatically.
+      send "quit\r"
+      expect eof
+    mode: '0755'
+  delegate_to: "{{ groups['trex_server'][0] }}"
+
+- name: Pause to allow T-Rex to stabilize
+  ansible.builtin.pause:
+    seconds: 10
+
+# --- EXECUTE EXPECT SCRIPT ---
+- name: Run validation test at {{ rate_gbps }}{{ rate_unit }} for {{ duration }}s
+  ansible.builtin.shell: |
+    /usr/bin/expect /tmp/trex_start_test.exp
+  args:
+    executable: /bin/bash
+    chdir: "{{ trex_install_dir }}"
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  register: trex_output
+  ignore_errors: yes
+
+- name: Save T-Rex output to log file
+  ansible.builtin.copy:
+    content: "{{ trex_output.stdout }}"
+    dest: "{{ results_file_name }}"
+  delegate_to: localhost
+  when: results_file_name is defined
+
+# --- CLEANUP ---
+- name: Remove expect script
+  ansible.builtin.file:
+    path: "/tmp/trex_start_test.exp"
+    state: absent
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
+
+- name: Clean up profile from T-Rex server
+  ansible.builtin.file:
+    path: "{{ trex_install_dir }}/{{ traffic_profile_name }}.py"
+    state: absent
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
+
+- name: Clean up temp profile on controller
+  ansible.builtin.file:
+    path: "/tmp/{{ traffic_profile_name }}.py"
+    state: absent
+  delegate_to: localhost
+  ignore_errors: yes

@@ -1,0 +1,22 @@
+# -----------------------------------------------------------------
+# Application Server Variables
+# -----------------------------------------------------------------
+# This file contains variables specific to the Application Server
+# host group. These settings are automatically loaded for hosts in
+# the app_server inventory group.
+# -----------------------------------------------------------------
+
+app_server_pci_addr: "04:00:0"  #CHANGE ME
+app_server_base_if: "enp4s0np0" #CHANGE ME
+
+# -----------------------------------------------------------------
+# SSH Connection Settings
+# -----------------------------------------------------------------
+# These variables inherit from global variables defined in all.yml
+# -----------------------------------------------------------------
+
+ansible_user: "{{ lab_ssh_user }}"
+ansible_ssh_private_key_file: ~/.ssh/lab_key
+#ansible_ssh_pass: "{{ lab_ssh_pass }}"
+ansible_become: yes  # Enable privilege escalation (sudo)
+ansible_python_interpreter: /usr/bin/python3.10

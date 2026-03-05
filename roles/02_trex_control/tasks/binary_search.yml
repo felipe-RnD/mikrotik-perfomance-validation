@@ -1,0 +1,274 @@
+# =============================================================================
+# Binary Search - Enhanced for High-Variance Virtualized Environments
+# =============================================================================
+# Improvements:
+#   1. Warmup traffic before measurement (stabilizes virtio/interrupt paths)
+#   2. Multi-sample mode with median selection (filters steal spikes)
+#   3. Variance detection and adaptive behavior
+#   4. Configurable convergence strictness
+# =============================================================================
+
+- name: Initialize binary search vars with defaults
+  ansible.builtin.set_fact:
+    search_low: null
+    search_high: null
+    search_current: null
+    found_rate: null
+    iteration: null
+    profile_flags: null
+    trex_stats: null
+    trex_stdout: null
+    retry_count: 0
+    pass_streak: 0
+    # New: tracking for variance detection
+    recent_results: []
+    variance_warnings: 0
+
+# -----------------------------------------------------------------------------
+# Configurable Parameters (can be overridden via -e or vars)
+# -----------------------------------------------------------------------------
+- name: Set tunable parameters with defaults
+  ansible.builtin.set_fact:
+    # Warmup: run traffic for N seconds before measuring (0 = disabled)
+    warmup_duration_sec: "{{ warmup_duration_sec | default(5) }}"
+    # Multi-sample: run N measurements per rate and take median (1 = single shot)
+    samples_per_rate: "{{ samples_per_rate | default(3) }}"
+    # Sample duration when multi-sampling (longer = more stable, 20-30s recommended for noisy VMs)
+    sample_duration_sec: "{{ sample_duration_sec | default(25) }}"
+    # Pause between samples (allows virtio/interrupt state to settle)
+    sample_pause_sec: "{{ sample_pause_sec | default(10) }}"
+    # Variance threshold: if stddev > this % of mean, log warning
+    variance_threshold_pct: "{{ variance_threshold_pct | default(50) }}"
+    # Consecutive passes required before advancing (already implemented, making explicit)
+    required_pass_streak: "{{ required_pass_streak | default(2) }}"
+
+- name: Ensure T-Rex service is running
+  ansible.builtin.systemd:
+    name: trex
+    state: started
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  register: trex_service
+
+- name: Wait for T-Rex RPC port to be ready
+  ansible.builtin.wait_for:
+    port: 4501
+    host: "{{ groups['trex_server'][0] }}"
+    delay: 5
+    timeout: 30
+  delegate_to: localhost
+  when: trex_service.changed
+
+- name: Generate T-Rex profile from template
+  ansible.builtin.template:
+    src: "templates/{{ 'l3_profile.py.j2' if 'l3' in traffic_profile_name else 'imix_profile.py.j2' }}"
+    dest: "/tmp/{{ traffic_profile_name }}.py"
+  vars:
+    packet_size: >-
+      {%- if 'large' in traffic_profile_name -%}
+        {{ large_packet_size | default(1360) }}
+      {%- elif 'l3' in traffic_profile_name -%}
+        {{ traffic_profile_name.split('_')[-1][:-1] }}
+      {%- else -%}
+        64
+      {%- endif -%}
+    profile_client_ip: "{{ profile_client_ip | default(omit) }}"
+    profile_server_ip: "{{ profile_server_ip | default(omit) }}"
+    profile_gateway_ip: "{{ profile_gateway_ip | default(omit) }}"
+  delegate_to: localhost
+
+# -------------------------------------------------------
+# DEBUG TASKS
+# -------------------------------------------------------
+- name: DEBUG - Check if profile was created
+  ansible.builtin.stat:
+    path: "/tmp/{{ traffic_profile_name }}.py"
+  delegate_to: localhost
+  register: profile_file_check
+
+- name: DEBUG - Display profile file status
+  ansible.builtin.debug:
+    msg: "Profile exists: {{ profile_file_check.stat.exists }}, Path: /tmp/{{ traffic_profile_name }}.py"
+
+- name: DEBUG - Display generated profile content
+  ansible.builtin.shell: |
+    cat /tmp/{{ traffic_profile_name }}.py | grep -E '(client_ip|server_ip) ='
+  delegate_to: localhost
+  register: profile_ips
+
+- name: DEBUG - Show profile IPs being used
+  ansible.builtin.debug:
+    msg: "{{ profile_ips.stdout_lines }}"
+# -------------------------------------------------------
+
+- name: Copy T-Rex profile to T-Rex server
+  ansible.builtin.copy:
+    src: "/tmp/{{ traffic_profile_name }}.py"
+    dest: "{{ trex_install_dir }}/{{ traffic_profile_name }}.py"
+    mode: '0755'
+  delegate_to: "{{ groups['trex_server'][0] }}"
+
+- name: DEBUG - Check T-Rex ARP table before test
+  ansible.builtin.shell: |
+    arp -n | grep -E '(Address|172\.16\.1\.)' || echo 'No relevant ARP entries'
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  register: arp_before
+  failed_when: false
+
+- name: DEBUG - Display ARP table
+  ansible.builtin.debug:
+    msg: "{{ arp_before.stdout_lines }}"
+
+- name: Initialize binary search bounds
+  ansible.builtin.set_fact:
+    search_low: "{{ binary_search_min_gbps }}"
+    search_high: "{{ binary_search_max_gbps }}"
+    search_current: "{{ ((binary_search_min_gbps | float + binary_search_max_gbps | float) / 2) | round(3) }}"
+    found_rate: 0
+    iteration: 0
+    retry_count: 0
+    pass_streak: 0
+    recent_results: []
+    variance_warnings: 0
+
+- name: Determine profile flags (ASTF or STL) - ONE TIME
+  ansible.builtin.set_fact:
+    profile_flags: "{{ '--astf --lro-disable' if 'session' in traffic_profile_name else '' }}"
+
+# -----------------------------------------------------------------------------
+# WARMUP PHASE - Stabilize virtio/interrupt paths before measuring
+# -----------------------------------------------------------------------------
+- name: Run warmup traffic (not measured)
+  when: warmup_duration_sec | int > 0
+  block:
+    - name: Display warmup notice
+      ansible.builtin.debug:
+        msg: "Running {{ warmup_duration_sec }}s warmup at {{ (binary_search_max_gbps | float * 0.5) | round(3) }} Gbps to stabilize virtio paths..."
+
+    - name: Create warmup batch file
+      ansible.builtin.copy:
+        content: |
+          start -f {{ trex_install_dir }}/{{ traffic_profile_name }}.py {{ profile_flags }} -m {{ (binary_search_max_gbps | float * 0.5) | round(3) }}gbps -d {{ warmup_duration_sec }}
+          wait
+          stop
+        dest: "/tmp/warmup_batch.txt"
+        mode: '0644'
+      delegate_to: "{{ groups['trex_server'][0] }}"
+
+    - name: Execute warmup traffic
+      ansible.builtin.shell: |
+        cd {{ trex_install_dir }} && \
+        timeout {{ (warmup_duration_sec | int) + 30 }} \
+        ./trex-console -q -f /tmp/warmup_batch.txt 2>&1 || true
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: warmup_result
+      failed_when: false
+
+    - name: Brief pause after warmup
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: Clean up warmup batch file
+      ansible.builtin.file:
+        path: "/tmp/warmup_batch.txt"
+        state: absent
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      ignore_errors: yes
+
+# -----------------------------------------------------------------------------
+# BINARY SEARCH LOOP
+# -----------------------------------------------------------------------------
+- name: Binary search loop
+  ansible.builtin.include_tasks: binary_search_iteration.yml
+  loop: "{{ range(0, 14) }}"
+  loop_control:
+    loop_var: iter_count
+  when: >
+    ((search_high | float - search_low | float) > (binary_search_resolution_gbps | float)) or
+    (retry_count | int > 0)
+  vars:
+    iteration_server_ip: "{{ profile_server_ip | default('10.0.0.2') }}"
+    iteration_client_ip: "{{ profile_client_ip | default('172.16.1.2') }}"
+    # Pass through multi-sample config to iteration task
+    use_multi_sample: "{{ samples_per_rate | int > 1 }}"
+
+# -----------------------------------------------------------------------------
+# POST-SEARCH ANALYSIS
+# -----------------------------------------------------------------------------
+- name: Analyze search stability
+  when: recent_results | length > 2
+  block:
+    - name: Calculate result variance
+      ansible.builtin.set_fact:
+        _tail_results: "{{ recent_results[-5:] if recent_results|length > 5 else recent_results }}"
+        
+    - name: Calculate mean of tail
+      ansible.builtin.set_fact:
+        result_mean: "{{ (_tail_results | map('float') | sum) / (_tail_results | length) }}"
+        
+    - name: Calculate standard deviation
+      vars:
+        mean_val: "{{ result_mean | float }}"
+        squared_diffs: "{{ _tail_results | map('float') | map('pow', 2) | sum - ((_tail_results | map('float') | sum) ** 2 / (_tail_results | length)) }}"
+      ansible.builtin.set_fact:
+        result_stddev: "{{ ((squared_diffs | float) / (_tail_results | length)) ** 0.5 }}"
+
+    - name: Check for high variance
+      when: 
+        - result_mean | float > 0
+        - ((result_stddev | float / result_mean | float) * 100) > (variance_threshold_pct | float)
+      ansible.builtin.debug:
+        msg: 
+          - "WARNING: HIGH VARIANCE DETECTED in binary search results"
+          - "Mean loss: {{ result_mean | float | round(4) }}%"
+          - "StdDev: {{ result_stddev | float | round(4) }}%"
+          - "Coefficient of Variation: {{ ((result_stddev | float / result_mean | float) * 100) | round(1) }}%"
+          - "This may indicate CPU steal or virtio contention. Consider:"
+          - "  - Checking host CPU isolation (isolcpus)"
+          - "  - Verifying IRQ affinity on host"
+          - "  - Running noise baseline (01b) to characterize"
+
+- name: Apply safety margin (Safe Load Factor) to found rate
+  ansible.builtin.set_fact:
+    # Uses safe_validation_factor if defined (e.g., 0.85), defaults to 0.95 if missing
+    achieved_gbps: "{{ (found_rate | float * (safe_validation_factor | default(0.95) | float)) | round(3) }}"
+
+- name: Display rate with safety margin
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Binary Search Complete"
+      - "============================================================"
+      - "Edge rate (last passing): {{ found_rate }} Gbps"
+      - "With configured safety margin:    {{ achieved_gbps }} Gbps"
+      - "Total iterations:         {{ iteration }}"
+      - "Variance warnings:        {{ variance_warnings }}"
+      - "============================================================"
+  when: found_rate | float > 0
+
+- name: Return achieved Gbps
+  ansible.builtin.set_fact:
+    gbps: "{{ achieved_gbps }}"
+
+# -----------------------------------------------------------------------------
+# CLEANUP
+# -----------------------------------------------------------------------------
+- name: Clean up stop batch file
+  ansible.builtin.file:
+    path: "/tmp/stop_batch.txt"
+    state: absent
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
+
+- name: Clean up profile from T-Rex server
+  ansible.builtin.file:
+    path: "{{ trex_install_dir }}/{{ traffic_profile_name }}.py"
+    state: absent
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
+
+- name: Clean up temp profile on controller
+  ansible.builtin.file:
+    path: "/tmp/{{ traffic_profile_name }}.py"
+    state: absent
+  delegate_to: localhost
+  ignore_errors: yes

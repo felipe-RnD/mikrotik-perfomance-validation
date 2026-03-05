@@ -1,0 +1,21 @@
+- name: 5.1 - Check MikroTik device connectivity and get version
+  community.routeros.command:
+    commands:
+      - /system resource print
+  register: mikrotik_details
+  changed_when: false
+  # Ensuring we only target the MikroTik group defined in your inventory
+  when: inventory_hostname in groups['mikrotik_dut']
+
+- name: 5.2 - Parse MikroTik software release
+  ansible.builtin.set_fact:
+    # Captures only the version number, ignoring suffixes like '(stable)'
+    mikrotik_sw_release: "{{ mikrotik_details.stdout[0] | regex_search('version:\\s*([0-9.]+)', '\\1') | first | trim }}"
+  when: 
+    - mikrotik_details.stdout is defined
+    - mikrotik_details.stdout[0] | regex_search('version:')
+
+- name: 5.3 - Display MikroTik version
+  ansible.builtin.debug:
+    msg: "Host {{ inventory_hostname }} is running RouterOS {{ mikrotik_sw_release }}"
+  when: mikrotik_sw_release is defined

@@ -1,0 +1,40 @@
+# -----------------------------------------------------------------
+# K6 Server Variables
+# -----------------------------------------------------------------
+# This file contains variables specific to the K6 Application
+# Testing Server. These settings are automatically loaded for hosts
+# in the k6_server inventory group.
+# -----------------------------------------------------------------
+
+# -----------------------------------------------------------------
+# SSH Connection Settings
+# -----------------------------------------------------------------
+
+ansible_user: "{{ lab_ssh_user }}"
+ansible_ssh_private_key_file: ~/.ssh/lab_key
+#ansible_ssh_pass: "{{ lab_ssh_pass }}"
+ansible_become: yes  # Enable privilege escalation (sudo)
+
+# -----------------------------------------------------------------
+# K6 Installation and Configuration
+# -----------------------------------------------------------------
+
+k6_binary_path: "/usr/bin/k6"
+k6_scripts_dir: "/opt/k6/scripts"
+k6_results_dir: "/opt/k6/results"  # Remote temp directory for results
+
+# -----------------------------------------------------------------
+# Test Parameters
+# -----------------------------------------------------------------
+# Reference: Test Plan Section 7.3 - Consolidated Scaling & Quality Test
+# These parameters control the K6 application testing behavior.
+# -----------------------------------------------------------------
+
+k6_scaling_vus: 200                                      # Virtual Users
+k6_scaling_duration: "120s"                              # Test duration
+k6_target_endpoint_http: "http://{{ app_server_ip }}/"  # HTTP endpoint
+k6_target_endpoint_db: "http://{{ app_server_ip }}:5000/db/query"  # Database endpoint
+k6_vus_db: 100                        # DB test virtual users
+k6_vus_http: 200                        # Virtual Users for HTTP tests 
+k6_default_duration: "120s"             # Duration for K6 tests
+k6_latency_threshold_ms: 200.0  # Max acceptable P95 latency

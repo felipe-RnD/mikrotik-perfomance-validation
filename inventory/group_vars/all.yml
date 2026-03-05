@@ -1,0 +1,76 @@
+# -----------------------------------------------------------------
+# Global Variables: Mikrotik Performance Test Framework
+# -----------------------------------------------------------------
+# This file contains variables that apply to ALL hosts in the
+# inventory. These are loaded automatically by Ansible.
+# -----------------------------------------------------------------
+
+# -----------------------------------------------------------------
+# Global Configuration
+# -----------------------------------------------------------------
+
+# Base directory for storing all test results
+results_base_dir: "~/mikrotik-performance-validation/results"
+
+# -----------------------------------------------------------------
+# SSH Credentials
+# -----------------------------------------------------------------
+# Update these credentials to match your lab environment.
+# These are used for non-Ansible-controlled devices.
+# -----------------------------------------------------------------
+
+lab_ssh_user: "scadmin"
+#lab_ssh_pass: "YourPasswordHere"  # CHANGEME - Update with actual password
+
+# -----------------------------------------------------------------
+# IP Addressing
+# -----------------------------------------------------------------
+# Reference: docs/Network Topology.md
+# These IPs are used throughout the test automation for connectivity
+# validation, traffic generation, and result collection.
+# -----------------------------------------------------------------
+
+# Application Server & Hub LAN Network (10.0.0.0/24)
+app_server_ip: "10.0.0.2"
+cisco_vlan201_ip: "10.0.0.1"
+
+# DUT LAN Gateways (172.16.0.0/30 and 172.16.0.4/30, VLAN 200)
+dut_trex_lan_ip: "172.16.1.1"  # T-Rex gateway (VNI-0/3)
+dut_k6_lan_ip: "172.16.0.1"    # K6 gateway (VNI-0/2)
+
+# Test Infrastructure IPs (172.16.0.0/30 and 172.16.0.4/30, VLAN 200)
+trex_ip: "172.16.1.2"   # T-Rex traffic generator
+k6_ip: "172.16.0.2"     # K6 application tester
+
+# -----------------------------------------------------------------
+# Test Scenario Parameters
+# -----------------------------------------------------------------
+
+
+# Scenario 2: L3 Baseline - Validation run parameters
+validation_duration_sec: 60
+monitor_interval_sec: 10
+
+# Scenario 5: Extended Stability - DUT monitoring
+stability_monitor_interval_sec: 60      # Monitor interval for stability test
+
+# Application server base URL (used by K6)
+app_server_base_url: "http://{{ app_server_ip }}"
+
+# -----------------------------------------------------------------
+# Large Packet Size Configuration (Mode-Dependent)
+# -----------------------------------------------------------------
+# SD-WAN mode: Use 1360 bytes to account for IPsec encapsulation overhead
+#   - IPsec ESP: ~50-70 bytes (header, IV, padding, ICV)
+#   - Outer IP: 20 bytes
+#   - Total overhead: ~70-90 bytes
+#   - 1360 + 90 = 1450 (safely under 1500 MTU)
+#
+# DIA mode: Use 1472 bytes (max UDP payload without fragmentation)
+#   - No tunnel encapsulation
+#   - IP header: 20 bytes + UDP header: 8 bytes = 28 bytes
+#   - 1472 + 28 = 1500 (exactly MTU)
+# -----------------------------------------------------------------
+
+# large_packet_size_sdwan: 1360    # Safe for IPsec tunnel encapsulation
+large_packet_size: 1472      # Max UDP payload without fragmentation

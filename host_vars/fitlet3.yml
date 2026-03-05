@@ -1,0 +1,44 @@
+# -----------------------------------------------------------------
+# Platform Profile: Fitlet3 (Generic Template)
+# -----------------------------------------------------------------
+# Reference: Test Plan Section 3.2 - Edge and Mini Computing Systems
+# This profile defines the hardware specifications and interface
+# mappings for the Fitlet3 platform (fanless x86 mini PC).
+# -----------------------------------------------------------------
+
+# Platform Identification
+platform_type: "Fitlet3"
+platform_cpu: "Intel Atom x7-E3950 (4 Cores)"
+platform_ram: "8 GB"
+platform_interface_speed_gb: 1  # 1GbE interfaces
+
+# -----------------------------------------------------------------
+# DUT Interface Mapping
+# -----------------------------------------------------------------
+# Maps logical interfaces to physical interface names on the Fitlet3.
+# Update these mappings to match your actual hardware configuration.
+# -----------------------------------------------------------------
+
+dut_interface_map:
+  mgmt: "eth4"              # Management interface
+  lan_k6_trex: "eth2.200"   # K6 and T-Rex LAN interface with VLAN 200
+  wan_trunk: "eth1"         # WAN trunk interface (VLANs 100-113)
+
+# -----------------------------------------------------------------
+# Expected Performance Ceilings (for reporting)
+# -----------------------------------------------------------------
+# These values are used for test validation and result comparison.
+# Adjust based on your actual hardware capabilities.
+# -----------------------------------------------------------------
+
+platform_expected_max_gbps: 0.95        # Expected max throughput (Gbps)
+platform_expected_max_sessions: 250000  # Expected max concurrent sessions
+
+# -----------------------------------------------------------------
+# Binary Search Configuration
+# -----------------------------------------------------------------
+# Override the default binary search max rate for this 1GbE platform.
+# This prevents the test from attempting rates beyond hardware limits.
+# -----------------------------------------------------------------
+
+binary_search_max_gbps: 1.0  # Max rate for binary search (Gbps)

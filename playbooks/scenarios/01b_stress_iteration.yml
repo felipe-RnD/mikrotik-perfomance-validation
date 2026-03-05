@@ -1,0 +1,92 @@
+# =============================================================================
+# MikroTik Stress Measurement Iteration (Phase 3)
+# =============================================================================
+
+- name: "S1b P3 - Iteration {{ stress_iter_num }}/{{ stress_iterations }} - Start"
+  ansible.builtin.debug:
+    msg: "Stress iteration {{ stress_iter_num }} at {{ stress_rate }} Gbps with MikroTik monitoring..."
+
+# -------------------------------------------------------------------------
+# Start MikroTik Monitoring (Background)
+# -------------------------------------------------------------------------
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Start MikroTik monitoring"
+  ansible.builtin.shell: |
+    ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+    {{ playbook_dir }}/../utils/run_monitoring.yml \
+      -e "monitor_duration_sec={{ stress_duration }}" \
+      -e "monitor_interval_sec=10" \
+      -e "monitor_start_delay_sec=5" \
+      -e "monitor_output_file={{ test_results_dir }}/s1b_stress_{{ stress_iter_num }}_monitor.log" \
+      -e "ansible_host={{ dut_ansible_host }}" \
+      -e "ansible_user={{ dut_ansible_user }}" \
+      -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+      -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+      -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+  args:
+    # Use your new MikroTik-specific project directory
+    chdir: /opt/mikrotik-perf-validation 
+  async: "{{ (stress_duration | int) + 90 }}"
+  poll: 0
+  register: stress_monitor_job
+  become: false
+  when: enable_monitoring | default(true)
+
+# -------------------------------------------------------------------------
+# Run T-Rex Traffic (Uses your adjusted 02_trex_control)
+# -------------------------------------------------------------------------
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Run traffic"
+  ansible.builtin.include_role:
+    name: 02_trex_control
+    tasks_from: start_test.yml
+  vars:
+    traffic_profile_name: "{{ ceiling_profile }}"
+    duration: "{{ stress_duration }}"
+    rate_gbps: "{{ stress_rate }}"
+    profile_client_ip: "{{ trex_ip }}"
+    profile_server_ip: "{{ app_server_ip }}"
+    profile_gateway_ip: "{{ dut_trex_lan_ip }}" # Pointing to MikroTik 172.16.1.1
+    results_file_name: "{{ test_results_dir }}/s1b_stress_{{ stress_iter_num }}_trex.log"
+
+# -------------------------------------------------------------------------
+# Wait for Monitoring to Complete
+# -------------------------------------------------------------------------
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Wait for monitoring"
+  ansible.builtin.async_status:
+    jid: "{{ stress_monitor_job.ansible_job_id }}"
+  register: monitor_result
+  until: monitor_result.finished
+  retries: 30
+  delay: 5
+  become: false
+  when: enable_monitoring | default(true)
+
+# -------------------------------------------------------------------------
+# Parse & Store Results (Vendor-neutral logic)
+# -------------------------------------------------------------------------
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Read T-Rex log"
+  ansible.builtin.slurp:
+    src: "{{ test_results_dir }}/s1b_stress_{{ stress_iter_num }}_trex.log"
+  register: stress_trex_log
+  delegate_to: localhost
+
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Parse results"
+  vars:
+    log_content: "{{ stress_trex_log.content | b64decode }}"
+    opackets_match: "{{ log_content | regex_search('opackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+    ipackets_match: "{{ log_content | regex_search('ipackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+  ansible.builtin.set_fact:
+    stress_opackets: "{{ opackets_match[0] | default('0') | int }}"
+    stress_ipackets: "{{ ipackets_match[0] | default('0') | int }}"
+
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Calculate loss"
+  ansible.builtin.set_fact:
+    stress_loss_pct: "{{ (((stress_opackets | int - stress_ipackets | int) / (stress_opackets | int)) * 100) if (stress_opackets | int) > 0 else 100.0 }}"
+
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Store result"
+  ansible.builtin.set_fact:
+    phase3_results: "{{ phase3_results + [{'iteration': stress_iter_num, 'tx_pkts': stress_opackets | int, 'rx_pkts': stress_ipackets | int, 'loss_pct': stress_loss_pct | float, 'rate_gbps': stress_rate, 'monitoring': true}] }}"
+
+- name: "S1b P3 - Iteration {{ stress_iter_num }} - Pause"
+  ansible.builtin.pause:
+    seconds: 10
+  when: stress_iter_num | int < stress_iterations | int

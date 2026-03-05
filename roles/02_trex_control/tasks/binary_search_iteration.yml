@@ -1,0 +1,291 @@
+# =============================================================================
+# Binary Search Iteration - Enhanced for High-Variance Environments
+# =============================================================================
+# Supports:
+#   - Single-shot mode (default, backwards compatible)
+#   - Multi-sample median mode (filters CPU steal spikes)
+#   - Variance tracking across iterations
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MULTI-SAMPLE MODE (when samples_per_rate > 1)
+# -----------------------------------------------------------------------------
+- name: Multi-sample measurement block
+  when: (samples_per_rate | default(1) | int) > 1
+  block:
+    - name: "Multi-sample: Run {{ samples_per_rate }} samples at {{ search_current }} Gbps"
+      ansible.builtin.include_tasks: multi_sample_measure.yml
+      vars:
+        sample_rate_gbps: "{{ search_current }}"
+        sample_count: "{{ samples_per_rate }}"
+        sample_duration: "{{ sample_duration_sec | default(15) }}"
+
+    - name: "Multi-sample: Use median loss value"
+      ansible.builtin.set_fact:
+        packet_loss_pct: "{{ multi_sample_loss_pct | float }}"
+        opackets: "{{ multi_sample_opackets | default('N/A') }}"
+        ipackets: "{{ multi_sample_ipackets | default('N/A') }}"
+
+    - name: "Multi-sample: Track variance"
+      ansible.builtin.set_fact:
+        recent_results: "{{ (recent_results | default([])) + [multi_sample_loss_pct | float] }}"
+        variance_warnings: "{{ (variance_warnings | default(0) | int) + (1 if (multi_sample_variance | default('low')) == 'high' else 0) }}"
+
+# -----------------------------------------------------------------------------
+# SINGLE-SHOT MODE (default, original behavior)
+# -----------------------------------------------------------------------------
+- name: Single-shot measurement block
+  when: (samples_per_rate | default(1) | int) <= 1
+  block:
+    - name: Create expect script for iteration {{ iteration }}
+      ansible.builtin.copy:
+        dest: "/tmp/trex_test_iter_{{ iteration }}.exp"
+        content: |
+          #!/usr/bin/expect -f
+          set timeout {{ binary_search_duration_sec | int + 30 }}
+          log_user 1
+
+          # Change to T-Rex directory and start console
+          cd {{ trex_install_dir }}
+          spawn ./trex-console
+
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT waiting for initial prompt"; exit 1 }
+          }
+
+          # Force release any stuck ports first
+          send "reset\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after reset"; exit 1 }
+          }
+
+          # Enable promiscuous mode
+          send "portattr -a --prom on\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after portattr"; exit 1 }
+          }
+
+          {% if 'session' in traffic_profile_name %}
+          # For ASTF: enable service mode and ping
+          send "service -p 0\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after service"; exit 1 }
+          }
+          send "ping -p 0 -d {{ iteration_server_ip }} -n 3\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after ping"; exit 1 }
+          }
+          {% endif %}
+
+          # Start the test
+          puts "Starting test at {{ search_current }} Gbps..."
+          send "start -f {{ trex_install_dir }}/{{ traffic_profile_name }}.py -m {{ search_current }}gbps {{ profile_flags }} --force\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after start"; exit 1 }
+          }
+
+          # Wait for test duration
+          puts "Running test for {{ binary_search_duration_sec }} seconds..."
+          sleep {{ binary_search_duration_sec }}
+
+          # Stop the test
+          puts "Stopping test..."
+          send "stop\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after stop"; exit 1 }
+          }
+
+          # Get stats
+          send "stats -a\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after stats"; exit 1 }
+          }
+
+          {% if 'session' in traffic_profile_name %}
+          # Disable service mode
+          send "service --off -p 0\r"
+          expect {
+            "trex>" {}
+            timeout { puts "TIMEOUT after service off"; exit 1 }
+          }
+          {% endif %}
+
+          # Release and quit - don't wait for prompt, just exit
+          send "release\r"
+          sleep 1
+          send "quit\r"
+          expect eof
+        mode: '0755'
+      delegate_to: "{{ groups['trex_server'][0] }}"
+
+    # --- EXECUTE EXPECT SCRIPT ---
+    - name: Run test iteration {{ iteration }} at {{ search_current }} Gbps
+      ansible.builtin.shell: |
+        /usr/bin/expect /tmp/trex_test_iter_{{ iteration }}.exp
+      args:
+        executable: /bin/bash
+        chdir: "{{ trex_install_dir }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: trex_single_session
+      ignore_errors: yes
+
+    # --- PARSE RESULTS FROM SINGLE SESSION OUTPUT ---
+    - name: 1. Safely extract stdout
+      ansible.builtin.set_fact:
+        trex_stdout: "{{ trex_single_session.stdout | default('') }}"
+
+    - name: 2a. Parse opackets (sent)
+      ansible.builtin.set_fact:
+        opackets_match: "{{ trex_stdout | regex_search('opackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+
+    - name: 2a. Extract opackets value
+      ansible.builtin.set_fact:
+        opackets: "{{ opackets_match[0] if opackets_match else '0' }}"
+
+    - name: 2b. Parse ipackets (received)
+      ansible.builtin.set_fact:
+        ipackets_match: "{{ trex_stdout | regex_search('ipackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+
+    - name: 2b. Extract ipackets value
+      ansible.builtin.set_fact:
+        ipackets: "{{ ipackets_match[0] if ipackets_match else '0' }}"
+
+    - name: 2c. Calculate packet loss (with zero protection)
+      ansible.builtin.set_fact:
+        packet_loss_pct: "{{ (((opackets | int - ipackets | int) / (opackets | int if (opackets | int) > 0 else 1)) * 100) | float }}"
+
+    - name: Track result for variance analysis
+      ansible.builtin.set_fact:
+        recent_results: "{{ (recent_results | default([])) + [packet_loss_pct | float] }}"
+
+    - name: Remove expect script
+      ansible.builtin.file:
+        path: "/tmp/trex_test_iter_{{ iteration }}.exp"
+        state: absent
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      ignore_errors: yes
+
+# =============================================================================
+# DECISION LOGIC (shared by both modes)
+# =============================================================================
+
+# NEW: High Loss Override
+# If loss is > 5%, force a failure state immediately. This skips the retry logic
+# because huge loss usually implies congestion, not just noise.
+- name: Logic - High Loss Override (>5%)
+  ansible.builtin.set_fact:
+    retry_count: 1     # Pretend we already retried to force a move down next step
+    was_retrying: true # Force logic to move down
+    run_passed: false
+  when: packet_loss_pct | float > 5.0
+
+- name: DEBUG - Show packet loss for this iteration
+  ansible.builtin.debug:
+    msg: "Iteration {{ iteration }}: Rate {{ search_current }} Gbps, opackets {{ opackets | default('N/A') }}, ipackets {{ ipackets | default('N/A') }}, Loss {{ packet_loss_pct | float | round(4) }}%{{ ' (median of ' + (samples_per_rate | string) + ' samples)' if (samples_per_rate | default(1) | int) > 1 else '' }}"
+
+- name: DEBUG - Check decision math
+  ansible.builtin.debug:
+    msg:
+      - "Packet Loss: {{ packet_loss_pct | float | round(4) }}%"
+      - "Configured Limit (Ratio): {{ binary_search_loss_pct }}"
+      - "Calculated Threshold (%): {{ (binary_search_loss_pct | float) * 100 }}"
+      - "Decision: Is {{ packet_loss_pct | float | round(4) }} <= {{ (binary_search_loss_pct | float) * 100 }} ?"
+      - "Retry Count: {{ retry_count }}"
+      - "Mode: {{ 'Multi-sample (median)' if (samples_per_rate | default(1) | int) > 1 else 'Single-shot' }}"
+
+# =========================================================================
+# DECISION LOGIC - Symmetric Confirmation
+# Requires 2 consecutive passes OR 2 consecutive fails to change direction
+# =========================================================================
+
+- name: Determine pass/fail status for this run
+  ansible.builtin.set_fact:
+    run_passed: "{{ (packet_loss_pct | float) <= ((binary_search_loss_pct | float) * 100) }}"
+  # Only evaluate if we didn't already force a fail above
+  when: packet_loss_pct | float <= 5.0
+
+- name: Capture pre-decision retry state
+  ansible.builtin.set_fact:
+    was_retrying: "{{ retry_count | int > 0 }}"
+
+# --- SUCCESS PATH ---
+- name: Logic - Success (Increment pass streak)
+  ansible.builtin.set_fact:
+    pass_streak: "{{ (pass_streak | default(0) | int) + 1 }}"
+    # UPDATED: We do NOT clear retry_count here anymore.
+    # We wait for the streak check below.
+  when: run_passed
+
+# NEW: Logic - Clear Retry (Only on streak)
+# We only assume the rate is "safe" if we have passed 2 times in a row.
+- name: Logic - Clear Retry (Only on streak)
+  ansible.builtin.set_fact:
+    retry_count: 0
+  when:
+    - run_passed
+    - pass_streak | int >= 2
+
+- name: Logic - Success Confirmed (Move UP after 2 consecutive passes)
+  ansible.builtin.set_fact:
+    search_low: "{{ search_current }}"
+    found_rate: "{{ search_current }}"
+    pass_streak: 0
+    search_current: "{{ ((search_current | float + search_high | float) / 2) | round(3) }}"
+  when:
+    - run_passed
+    - (pass_streak | int) >= 2
+
+- name: DEBUG - Pass streak status
+  ansible.builtin.debug:
+    msg: "Pass streak: {{ pass_streak }}. {% if (pass_streak | int) >= 2 %}CONFIRMED - moving up{% else %}Staying at {{ search_current }} Gbps to confirm{% endif %}"
+  when: run_passed
+
+# --- FAILURE PATH ---
+- name: Logic - Failure (Reset pass streak)
+  ansible.builtin.set_fact:
+    pass_streak: 0
+  when: not run_passed
+
+- name: DEBUG - Retry Triggered
+  ansible.builtin.debug:
+    msg: "Packet loss high ({{ packet_loss_pct | float | round(4) }}%). Retrying same rate ({{ search_current }} Gbps) to confirm."
+  when:
+    - not run_passed
+    - retry_count | default(0) | int == 0
+
+- name: Logic - First Failure (Retry Same Rate)
+  ansible.builtin.set_fact:
+    retry_count: 1
+  when:
+    - not run_passed
+    - retry_count | default(0) | int == 0
+
+- name: Logic - Confirmed Failure (Move DOWN)
+  ansible.builtin.set_fact:
+    search_high: "{{ search_current }}"
+    retry_count: 0
+    search_current: "{{ ((search_low | float + search_current | float) / 2) | round(3) }}"
+  when:
+    - not run_passed
+    - was_retrying | bool
+
+- name: DEBUG - Decision Summary
+  ansible.builtin.debug:
+    msg: "Run Passed: {{ run_passed }}, Pass Streak: {{ pass_streak }}, Was Retrying: {{ was_retrying }} -> Retry Count: {{ retry_count }}"
+
+- name: 3d. Increment iteration counter
+  ansible.builtin.set_fact:
+    iteration: "{{ iteration | int + 1 }}"
+
+# --- INTER-ITERATION CLEANUP ---
+- name: Wait between iterations for port cleanup
+  ansible.builtin.pause:
+    seconds: 15

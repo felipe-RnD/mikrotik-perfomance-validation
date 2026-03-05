@@ -1,0 +1,29 @@
+- name: STOP TEST - Stop all T-Rex traffic
+  hosts: trex_server
+  gather_facts: no
+  vars_files:
+    - ../inventory/group_vars/trex_server.yml
+  
+  tasks:
+    - name: Create stop batch file
+      ansible.builtin.copy:
+        dest: "/tmp/stop_batch.txt"
+        content: |
+          stop
+          quit
+        mode: '0755'
+
+    - name: Send stop command via trex-console
+      ansible.builtin.shell: ./trex-console --batch /tmp/stop_batch.txt
+      args:
+        chdir: "{{ trex_install_dir }}"
+        executable: /bin/bash
+      register: trex_stop
+      changed_when: true
+      failed_when: false
+
+    - name: Clean up stop batch file
+      ansible.builtin.file:
+        path: "/tmp/stop_batch.txt"
+        state: absent
+      ignore_errors: yes

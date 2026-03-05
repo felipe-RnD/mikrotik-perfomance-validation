@@ -1,0 +1,97 @@
+- name: "Validation Test for 02_trex_control Role (Using Inventory Variables)"
+  hosts: trex_server
+  gather_facts: no
+
+  tasks:
+    - name: "SETUP: Clean up previous validation artifacts"
+      ansible.builtin.file:
+        path: "/tmp/trex_validation_results"
+        state: absent
+      delegate_to: localhost
+
+    - name: "SETUP: Create results directory"
+      ansible.builtin.file:
+        path: "/tmp/trex_validation_results"
+        state: directory
+        mode: '0777'
+      delegate_to: localhost
+
+    # ============================================================
+    # TEST 1: IMIX Validation (Stateless)
+    # ============================================================
+    - name: "--- TEST 1: Run IMIX Validation (Stateless) ---"
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test
+      vars:
+        traffic_profile_name: "validation_imix"
+        rate_gbps: 0.1
+        duration: 10
+        results_file_name: "/tmp/trex_validation_results/imix_output.txt"
+
+    - name: "TEST 1: Verify IMIX passed"
+      ansible.builtin.fail:
+        msg: "IMIX test failed or produced no output"
+      when: trex_output.rc != 0
+
+    # ============================================================
+    # TEST 2: L3 Validation (Stateless)
+    # ============================================================
+    - name: "--- TEST 2: Run L3 Validation (Stateless) ---"
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test
+      vars:
+        # [FIX] Changed name to end in '_64b' so the role correctly extracts '64' as packet size
+        traffic_profile_name: "validation_l3_64b"
+        rate_gbps: 0.1
+        duration: 10
+        results_file_name: "/tmp/trex_validation_results/l3_output.txt"
+
+    - name: "TEST 2: Verify L3 passed"
+      ansible.builtin.fail:
+        msg: "L3 test failed or produced no output"
+      when: trex_output.rc != 0
+
+    # ============================================================
+    # TEST 3: Session Validation (Stateful/ASTF)
+    # ============================================================
+    - name: "--- TEST 3: Run Session Scalability Validation (ASTF) ---"
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test
+      vars:
+        traffic_profile_name: "validation_session"
+        rate_gbps: 0.5
+        duration: 10
+        results_file_name: "/tmp/trex_validation_results/session_output.txt"
+
+    - name: "TEST 3: Verify Session passed"
+      ansible.builtin.fail:
+        msg: "Session test failed or produced no output"
+      when: trex_output.rc != 0
+
+    # ============================================================
+    # CLEANUP
+    # ============================================================
+    - name: "--- CLEANUP: Return to Standard STL Mode ---"
+      ansible.builtin.systemd:
+        name: trex-astf
+        state: stopped
+      ignore_errors: yes
+
+    - name: "--- CLEANUP: Ensure STL Service is Running ---"
+      ansible.builtin.systemd:
+        name: trex
+        state: started
+
+    - name: "--- VALIDATION SUMMARY ---"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "ALL TESTS PASSED SUCCESSFULLY"
+          - "=========================================="
+          - "1. IMIX (Stateless): OK"
+          - "2. L3 (Stateless): OK"
+          - "3. Session (ASTF): OK"
+          - "=========================================="

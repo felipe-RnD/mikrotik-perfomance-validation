@@ -1,0 +1,85 @@
+- name: "Validation Test for 03_k6_control Role"
+  hosts: localhost  # Run on localhost since the role delegates to K6 server
+  gather_facts: no
+  vars_files:
+    - ../inventory/group_vars/k6_server.yml
+    - ../inventory/group_vars/app_server.yml
+    - ../inventory/group_vars/all.yml
+
+  vars:
+    # We need to explicitly extract K6/App vars because we are on localhost
+    # and avoiding global var loading collisions
+    k6_hostname: "{{ groups['k6_server'][0] }}"
+    app_server_target: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+
+  tasks:
+    - name: "SETUP: Set test run directory variable"
+      ansible.builtin.set_fact:
+        _test_run_dir: "/tmp/k6_validation_{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "SETUP: Create validation results directory on controller"
+      ansible.builtin.file:
+        path: "{{ _test_run_dir }}"
+        state: directory
+        mode: '0777'
+
+    - name: "SETUP: Define EXPECTED local result path"
+      ansible.builtin.set_fact:
+        # This is where we tell the role to put the file on the Controller
+        _results_file_local_path: "{{ _test_run_dir }}/k6_validation_results.json"
+
+    - name: "SETUP: Display test configuration"
+      ansible.builtin.debug:
+        msg:
+          - "Target K6 Server: {{ k6_hostname }}"
+          - "Target App Server: {{ app_server_target }}"
+          - "Expected Local Result: {{ _results_file_local_path }}"
+
+    # ============================================================
+    # TEST 1: Run the Role (It should run K6 and Fetch result)
+    # ============================================================
+    - name: "--- TEST 1: Run 5s, 1-VU HTTP test ---"
+      ansible.builtin.include_role:
+        name: 03_k6_control
+        tasks_from: run_test.yml
+      vars:
+        # Role variables
+        k6_test_profile: "http_validation"
+        k6_vus: 1
+        k6_duration: "5s"
+        k6_target_url: "http://{{ app_server_target }}"
+        # NEW LOGIC: This is the destination on the Controller
+        results_file_name: "{{ _results_file_local_path }}"
+
+    # ============================================================
+    # TEST 2: Verify Result on Controller
+    # ============================================================
+    - name: "--- TEST 2: Verify JSON file exists LOCALLY on Controller ---"
+      ansible.builtin.stat:
+        path: "{{ _results_file_local_path }}"
+      register: k6_json_stat
+
+    - name: "TEST 2: Fail if local JSON file is missing"
+      ansible.builtin.fail:
+        msg: "Validation Failed! The role did not fetch the JSON file to '{{ _results_file_local_path }}'."
+      when: not k6_json_stat.stat.exists
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
+    - name: "--- VALIDATION SUMMARY ---"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "k6 Control Role Validation Summary"
+          - "=========================================="
+          - "k6 Execution: PASS"
+          - "Result Fetch: {{ 'PASS' if k6_json_stat.stat.exists else 'FAIL' }}"
+          - "Local File:   {{ _results_file_local_path }}"
+          - "=========================================="
+
+    # ============================================================
+    # CLEANUP
+    # ============================================================
+    # No remote cleanup needed here; the role leaves the remote copy
+    # in /opt/k6/results/ for debug purposes, which is fine.

@@ -1,0 +1,89 @@
+- name: MONITOR - Validate monitoring parameters
+  ansible.builtin.assert:
+    that:
+      - monitor_duration_sec is defined
+      - monitor_interval_sec is defined
+      - monitor_output_file is defined
+    fail_msg: "Required variables: monitor_duration_sec, monitor_interval_sec, monitor_output_file"
+
+- name: MONITOR - Calculate iterations
+  ansible.builtin.set_fact:
+    monitor_iterations: "{{ (monitor_duration_sec | int / monitor_interval_sec | int) | int }}"
+
+- name: MONITOR - Generate persistent Expect script (MikroTik)
+  ansible.builtin.copy:
+    dest: "/tmp/persistent_monitor_{{ inventory_hostname }}.exp"
+    mode: '0755'
+    content: |
+      #!/usr/bin/expect -f
+      # This script maintains a single open SSH session for MikroTik RouterOS
+
+      set timeout -1
+      log_user 1
+
+      # 1. Establish Connection ONCE
+      spawn ssh {{ ansible_user }}@{{ ansible_host }}
+      expect {
+        "password:" { send "{{ ansible_ssh_pass }}\r" }
+        "(yes/no)" { send "yes\r"; exp_continue }
+      }
+      # MikroTik prompt typically ends with ' > '
+      expect " > "
+
+      # 2. Initial Delay (Avoid Test Ramp-up)
+      {% if monitor_start_delay_sec | default(0) | int > 0 %}
+      sleep {{ monitor_start_delay_sec }}
+      {% endif %}
+
+      # 3. Monitoring Loop
+      set max_iter {{ monitor_iterations }}
+
+      for {set i 1} {$i <= $max_iter} {incr i} {
+
+          # Print Header for Log parsing
+          puts "\n================================================================================"
+          puts "Iteration $i/$max_iter - [clock format [clock seconds] -format \"%Y-%m-%dT%H:%M:%S\"]"
+          puts "================================================================================"
+
+          # Run MikroTik Commands
+          # CPU and Resource usage (Equivalent to system load-stats)
+          send "/system resource print\r"
+          expect " > "
+
+          # Interface Statistics (Equivalent to port statistics brief)
+          # Specifically targeting ether2 (T-Rex) and ether1 (WAN) from lab diagram
+          send "/interface print stats where name={{ dut_interface_map.lan_trex }} or name={{ dut_interface_map.wan_trunk }}\r"
+          expect " > "
+
+          # Active Sessions / Tracked Connections
+          send "/ip firewall connection print count-only\r"
+          expect " > "
+
+          # System Health (Voltage/Temp for Fitlet/Lanner hardware)
+          send "/system health print\r"
+          expect " > "
+
+          # Sleep logic remains identical to maintain framework timing
+          if {$i < $max_iter} {
+              if {$i == 1} {
+                  sleep {{ monitor_first_interval_sec | default(10) }}
+              } else {
+                  sleep {{ monitor_interval_sec }}
+              }
+          }
+      }
+
+      # 4. Clean Exit
+      send "/quit\r"
+      expect eof
+  delegate_to: localhost
+  become: false
+
+- name: MONITOR - Execute persistent monitoring (Async)
+  ansible.builtin.shell: |
+    /tmp/persistent_monitor_{{ inventory_hostname }}.exp > {{ monitor_output_file }} 2>&1
+  async: "{{ monitor_duration_sec | int + 60 }}"
+  poll: 0
+  register: monitor_job
+  delegate_to: localhost
+  become: false

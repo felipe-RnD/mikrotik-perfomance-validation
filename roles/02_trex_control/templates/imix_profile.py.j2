@@ -1,0 +1,80 @@
+# STL profile for IMIX traffic with IP variation for core distribution - UNIDIRECTIONAL
+from trex.stl.api import *
+
+class STLS1(object):
+
+    def create_stream (self, size, weight):
+        client_ip = "{{ profile_client_ip | default('172.16.1.2') }}"
+        server_ip = "{{ profile_server_ip | default('10.0.0.2') }}"
+
+        base_pkt = Ether()/Dot1Q(vlan=200)/IP(src=client_ip, dst=server_ip) / UDP(dport=12, sport=10000, chksum=0)
+
+        pad_len = size - len(base_pkt)
+        if pad_len < 0:
+            pad_len = 0
+        pad = pad_len * 'x'
+
+        # VM (Field Engine) - IP and PORT variation for better hash distribution
+        vm = STLVM()
+
+        # Flow variable 1: Vary source IP across subnet range
+        # 172.16.1.2 to 172.16.1.50 = 49 different source IPs
+        vm.var(name="src_ip",
+               min_value="172.16.1.2",
+               max_value="172.16.1.50",
+               size=4,
+               op="random")
+
+        # Write the varied IP to the packet's source IP field
+        vm.write(fv_name="src_ip", pkt_offset="IP.src")
+
+        # Flow variable 2: Vary source port - 5 ports to minimize sessions
+        vm.var(name="src_port",
+               min_value=10000,
+               max_value=10004,
+               size=2,
+               op="random")
+
+        # Write the varied port to the packet's source port field
+        vm.write(fv_name="src_port", pkt_offset="UDP.sport")
+
+        # Flow variable 3: Vary destination port - CRITICAL FOR HASH DISTRIBUTION
+        # 16 destination ports (12-16) to create 49 x 5 x 5 = 1,225 unique flows
+        vm.var(name="dst_port",
+               min_value=12,
+               max_value=16,
+               size=2,
+               op="random")
+
+        # Write the varied destination port to the packet's destination port field
+        vm.write(fv_name="dst_port", pkt_offset="UDP.dport")
+
+        # Fix IP checksum after modifying source IP
+        vm.fix_chksum(offset="IP")
+
+        # Fix UDP checksum after modifying source IP and ports
+        vm.fix_chksum_hw(l3_offset='IP', l4_offset='UDP', l4_type=CTRexVmInsFixHwCs.L4_TYPE_UDP)
+
+        pkt = STLPktBuilder(pkt = base_pkt/pad, vm = vm)
+
+        return STLStream(
+            packet = pkt,
+            mode = STLTXCont(pps = weight)
+        )
+
+    def get_streams (self, tunables, **kwargs):
+        streams = []
+
+        imix_table = [
+            {'size': 64,   'weight': 2.0},
+            {'size': 576,  'weight': 3.0},
+            {'size': 1360, 'weight': 5.0}
+        ]
+
+        for item in imix_table:
+            streams.append(self.create_stream(item['size'], item['weight']))
+
+        return streams
+
+def register():
+    return STLS1()

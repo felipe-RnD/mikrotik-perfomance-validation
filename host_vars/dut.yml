@@ -1,0 +1,72 @@
+# -----------------------------------------------------------------
+# !! MANUAL CONFIGURATION REQUIRED !!
+# -----------------------------------------------------------------
+# The test engineer MUST edit this file before every test run
+# to match the VM profile being tested.
+# This variable is used for logging and result directory naming.
+# 
+#
+# Valid profile examples:
+#   - "Essential_2C_6G"
+#   - "Minimum_4C_8G"
+#   - "Standard-Small_6C_12G"
+#   - "Standard-Medium_8C_16G"
+#   - "Standard-Large_12C_24G"
+#   - "Maximum_16C_32G"
+# -----------------------------------------------------------------
+
+dut_current_profile: "Minimum_4C_8G"
+
+# -----------------------------------------------------------------
+# Platform Selection
+# -----------------------------------------------------------------
+# Uncomment the platform being tested. This name is used to
+# dynamically load the correct host_vars file.
+#
+# Available platforms:
+#   - lanner_1516a (Intel Atom C3958, 16 cores, 64GB RAM, 10GbE)
+#   - lanner_1510d (Intel Atom C3758, 8 cores, 16GB RAM, 1GbE)
+#   - fitlet3 (Fanless x86 mini PC, 4 cores, 8GB RAM)
+# -----------------------------------------------------------------
+
+# platform_name: "lanner_1516a"  # CHANGEME - Update to match your hardware
+# platform_name: "lanner_1510d"
+platform_name: "fitlet3"
+
+# -----------------------------------------------------------------
+# Binary Search Configuration
+# -----------------------------------------------------------------
+# Override the default binary search max rate for this 10GbE platform.
+# This allows tests to explore the full performance envelope.
+# -----------------------------------------------------------------
+
+binary_search_max_gbps: 1.0  # Max rate for binary search (Gbps)
+
+# Specific limits per packet size (useful if PPS limits are hit before BW limits)
+binary_search_max_64b_gbps: 0.150
+binary_search_max_512b_gbps: 1.000
+binary_search_max_large_gbps: 3.00
+binary_search_max_imix_gbps: 1.00
+
+
+target_max_sessions: 500000
+session_target_cps: 2000
+
+# -----------------------------------------------------------------
+# Reporting & Validation Thresholds
+# -----------------------------------------------------------------
+# Calculated by Scenario 01b (Noise Baseline).
+# This acts as the Single Source of Truth for "Pass/Fail" in reports.
+# -----------------------------------------------------------------
+
+binary_search_loss_pct: 0.00242           # ITU-T Y.1564 standard for "Service Activation Testing" +0.1% for baseline noise
+validation_loss_pct: 0.336  # Update this based on S01b results
+
+# Define your mode-specific factors
+#safe_validation_factor_sdwan: 0.86
+#safe_validation_factor_dia: 0.86
+
+# Dynamic Selector
+# This variable changes value automatically based on the active test mode.
+safe_validation_factor: 0.85 #"{{ safe_validation_factor_sdwan if test_mode|default('') == 'sdwan' else safe_validation_factor_dia }}"
+

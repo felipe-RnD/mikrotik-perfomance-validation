@@ -1,0 +1,98 @@
+# =============================================================================
+# MikroTik Observer Iteration (Phase 4)
+# =============================================================================
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }}/{{ observer_iterations }} - {{ 'WITH' if monitoring_enabled else 'WITHOUT' }} Monitoring"
+  ansible.builtin.debug:
+    msg: "Observer iteration {{ observer_iter_num }} at {{ observer_rate }} Gbps (monitoring={{ monitoring_enabled }})"
+
+# -------------------------------------------------------------------------
+# Start MikroTik Monitoring (Conditional)
+# -------------------------------------------------------------------------
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Start monitoring"
+  ansible.builtin.shell: |
+    ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+    {{ playbook_dir }}/../utils/run_monitoring.yml \
+      -e "monitor_duration_sec={{ observer_duration }}" \
+      -e "monitor_interval_sec=10" \
+      -e "monitor_start_delay_sec=5" \
+      -e "monitor_output_file={{ test_results_dir }}/s1b_observer_{{ 'on' if monitoring_enabled else 'off' }}_{{ observer_iter_num }}_monitor.log" \
+      -e "ansible_host={{ dut_ansible_host }}" \
+      -e "ansible_user={{ dut_ansible_user }}" \
+      -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+      -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+      -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+  args:
+    # Adjusted for your MikroTik project directory
+    chdir: /opt/mikrotik-perf-validation 
+  async: "{{ (observer_duration | int) + 90 }}"
+  poll: 0
+  register: observer_monitor_job
+  become: false
+  when: monitoring_enabled | bool
+
+# -------------------------------------------------------------------------
+# Run T-Rex Traffic (Uses adjusted 02_trex_control)
+# -------------------------------------------------------------------------
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Run traffic"
+  ansible.builtin.include_role:
+    name: 02_trex_control
+    tasks_from: start_test.yml
+  vars:
+    traffic_profile_name: "{{ ceiling_profile }}"
+    duration: "{{ observer_duration }}"
+    rate_gbps: "{{ observer_rate }}"
+    profile_client_ip: "{{ trex_ip }}"
+    profile_server_ip: "{{ app_server_ip }}"
+    profile_gateway_ip: "{{ dut_trex_lan_ip }}" # Pointing to MikroTik 172.16.1.1
+    results_file_name: "{{ test_results_dir }}/s1b_observer_{{ 'on' if monitoring_enabled else 'off' }}_{{ observer_iter_num }}_trex.log"
+
+# -------------------------------------------------------------------------
+# Wait for Monitoring (if enabled)
+# -------------------------------------------------------------------------
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Wait for monitoring"
+  ansible.builtin.async_status:
+    jid: "{{ observer_monitor_job.ansible_job_id }}"
+  register: observer_monitor_result
+  until: observer_monitor_result.finished
+  retries: 30
+  delay: 5
+  become: false
+  when: monitoring_enabled | bool
+
+# -------------------------------------------------------------------------
+# Parse & Store Results (Vendor-neutral)
+# -------------------------------------------------------------------------
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Read T-Rex log"
+  ansible.builtin.slurp:
+    src: "{{ test_results_dir }}/s1b_observer_{{ 'on' if monitoring_enabled else 'off' }}_{{ observer_iter_num }}_trex.log"
+  register: observer_trex_log
+  delegate_to: localhost
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Parse results"
+  vars:
+    log_content: "{{ observer_trex_log.content | b64decode }}"
+    opackets_match: "{{ log_content | regex_search('opackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+    ipackets_match: "{{ log_content | regex_search('ipackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+  ansible.builtin.set_fact:
+    observer_opackets: "{{ opackets_match[0] | default('0') | int }}"
+    observer_ipackets: "{{ ipackets_match[0] | default('0') | int }}"
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Calculate loss"
+  ansible.builtin.set_fact:
+    observer_loss_pct: "{{ (((observer_opackets | int - observer_ipackets | int) / (observer_opackets | int)) * 100) if (observer_opackets | int) > 0 else 100.0 }}"
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Store to monitor ON list"
+  ansible.builtin.set_fact:
+    phase4_monitor_on_results: "{{ phase4_monitor_on_results + [{'iteration': observer_iter_num, 'tx_pkts': observer_opackets | int, 'rx_pkts': observer_ipackets | int, 'loss_pct': observer_loss_pct | float, 'rate_gbps': observer_rate, 'monitoring': true}] }}"
+  when: monitoring_enabled | bool
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Store to monitor OFF list"
+  ansible.builtin.set_fact:
+    phase4_monitor_off_results: "{{ phase4_monitor_off_results + [{'iteration': observer_iter_num, 'tx_pkts': observer_opackets | int, 'rx_pkts': observer_ipackets | int, 'loss_pct': observer_loss_pct | float, 'rate_gbps': observer_rate, 'monitoring': false}] }}"
+  when: not (monitoring_enabled | bool)
+
+- name: "S1b P4 - Iteration {{ observer_iter_num }} - Pause"
+  ansible.builtin.pause:
+    seconds: 10
+  when: observer_iter_num | int < observer_iterations | int

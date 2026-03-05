@@ -1,0 +1,25 @@
+- name: 4.1 - Check Nginx service
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: yes
+  check_mode: yes # Don't start it, just check
+  register: nginx_status
+
+- name: 4.2 - Fail if Nginx is not running
+  ansible.builtin.fail:
+    msg: "Nginx service is not running or not enabled on App Server."
+  when: "nginx_status.status.ActiveState != 'active' or nginx_status.status.LoadState != 'loaded'"
+
+- name: 4.3 - Check PostgreSQL service
+  ansible.builtin.systemd:
+    name: postgresql
+    state: started
+    enabled: yes
+  check_mode: yes
+  register: pg_status
+
+- name: 4.4 - Fail if PostgreSQL is not running
+  ansible.builtin.fail:
+    msg: "PostgreSQL service is not running or not enabled on App Server."
+  when: "pg_status.status.ActiveState != 'active' or pg_status.status.LoadState != 'loaded'"

@@ -1,0 +1,34 @@
+# -----------------------------------------------------------------
+# Mikrotik Device Variables
+# -----------------------------------------------------------------
+# This file contains variables specific to Mikrotik devices (DUTs and
+# Hubs). These settings are automatically loaded for hosts in the
+# mikrotik_devices inventory group.
+# -----------------------------------------------------------------
+
+# -----------------------------------------------------------------
+# SSH Connection Settings for Mikrotik Devices
+# -----------------------------------------------------------------
+ansible_user: scadmin
+# ansible_ssh_pass: Scadmin
+ansible_connection: ansible.netcommon.network_cli
+ansible_network_os: community.routeros.routeros
+
+#Override global 'become = true' from ansible.cfg
+#Mikrotik devices do not use 'sudo'
+ansible_become: no
+ansible_become_method: none
+
+# -----------------------------------------------------------------
+# DUT Interface Mapping
+# -----------------------------------------------------------------
+# Define which physical interfaces are used for WAN and LAN
+dut_interface_map:
+  wan_trunk: "ether1"  # CHANGEME - Adjust to your DUT's WAN trunk interface
+
+# -----------------------------------------------------------------
+# Performance Test Parameters
+# -----------------------------------------------------------------
+# These use the results from your Noise Baseline Analysis
+vlan_id: 200
+mikrotik_mac_address: "00:00:00:00:00:00" # CHANGEME - MAC of ether2

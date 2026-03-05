@@ -1,0 +1,19 @@
+- name: 2.1 - Check T-Rex installation directory
+  ansible.builtin.stat:
+    path: "{{ trex_install_dir }}/_t-rex-64-o"
+  register: trex_binary
+
+- name: 2.2 - Fail if T-Rex binary is missing
+  ansible.builtin.fail:
+    msg: "T-Rex binary not found at {{ trex_install_dir }}/_t-rex-64-o. Please run Configuration Guide.md."
+  when: not trex_binary.stat.exists
+
+- name: 2.3 - Check T-Rex config file
+  ansible.builtin.stat:
+    path: "{{ trex_config_file }}"
+  register: trex_config
+
+- name: 2.4 - Fail if T-Rex config is missing
+  ansible.builtin.fail:
+    msg: "T-Rex config not found at {{ trex_config_file }}. Please run Configuration Guide.md."
+  when: not trex_config.stat.exists
