@@ -22,12 +22,15 @@
       log_user 1
 
       # 1. Establish Connection ONCE
-      spawn ssh {{ ansible_user }}@{{ ansible_host }}
+      spawn ssh -o StrictHostKeyChecking=no{{ ansible_user }}@{{ ansible_host }}
       expect {
         "password:" { send "{{ ansible_ssh_pass }}\r" }
         "(yes/no)" { send "yes\r"; exp_continue }
       }
       # MikroTik prompt typically ends with ' > '
+      send "/console screen-256-colors disable\r"
+      expect " > "  
+      send "/console set numbers=no\r"
       expect " > "
 
       # 2. Initial Delay (Avoid Test Ramp-up)
@@ -52,7 +55,7 @@
 
           # Interface Statistics (Equivalent to port statistics brief)
           # Specifically targeting ether2 (T-Rex) and ether1 (WAN) from lab diagram
-          send "/interface print stats where name={{ dut_interface_map.lan_trex }} or name={{ dut_interface_map.wan_trunk }}\r"
+          send "/interface print stats where name={{ dut_lan_trex }} or name={{ dut_wan_trunk }}\r"
           expect " > "
 
           # Active Sessions / Tracked Connections

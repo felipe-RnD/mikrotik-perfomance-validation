@@ -21,7 +21,8 @@ platform_interface_speed_gb: 1  # 1GbE interfaces
 
 dut_interface_map:
   mgmt: "eth4"              # Management interface
-  lan_k6_trex: "eth2.200"   # K6 and T-Rex LAN interface with VLAN 200
+  lan_trex: "eth3.200"   # K6 and T-Rex LAN interface with VLAN 200
+  lan_k6: "eth3.203"
   wan_trunk: "eth1"         # WAN trunk interface (VLANs 100-113)
 
 # -----------------------------------------------------------------

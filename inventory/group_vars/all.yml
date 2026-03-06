@@ -10,7 +10,7 @@
 # -----------------------------------------------------------------
 
 # Base directory for storing all test results
-results_base_dir: "~/mikrotik-performance-validation/results"
+results_base_dir: "/home/scadmin/mikrotik-perfomance-validation/results"
 
 # -----------------------------------------------------------------
 # SSH Credentials

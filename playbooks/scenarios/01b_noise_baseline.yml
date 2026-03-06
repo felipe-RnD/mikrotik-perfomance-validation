@@ -89,7 +89,7 @@
     - name: S1b - Set DUT connection variables
       ansible.builtin.set_fact:
         dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
-        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] | default('scadmin')}}"
         dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
         trex_ip: "{{ hostvars[groups['trex_server'][0]]['trex_ip'] }}"
         app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"

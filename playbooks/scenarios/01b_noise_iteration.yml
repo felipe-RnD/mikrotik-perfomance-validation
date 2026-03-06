@@ -24,7 +24,7 @@
       -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
   args:
     # Pointing to your new MikroTik project directory
-    chdir: /opt/mikrotik-perf-validation 
+    chdir: /home/scadmin/mikrotik-perfomance-validation
   async: "{{ (noise_test_duration_sec | int) + 60 }}"
   poll: 0
   register: monitor_job
