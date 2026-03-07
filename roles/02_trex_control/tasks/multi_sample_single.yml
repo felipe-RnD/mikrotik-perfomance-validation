@@ -1,110 +1,110 @@
 # =============================================================================
-# Multi-Sample Measurement Helper
+# Single Sample Measurement (called by multi_sample_measure.yml)
 # =============================================================================
-# Purpose: Run multiple short traffic samples and return median loss value
-# This filters out CPU steal spikes that cause single-shot measurements to fail
-#
-# Input variables:
-#   - sample_rate_gbps: Rate to test
-#   - sample_count: Number of samples to take (default 3)
-#   - sample_duration: Duration per sample in seconds (default 15)
-#
-# Output variables:
-#   - multi_sample_loss_pct: Median loss across samples
-#   - multi_sample_results: List of all sample results
-#   - multi_sample_variance: Variance indicator (low/medium/high)
-#   - multi_sample_opackets: Total opackets from last sample (for logging)
-#   - multi_sample_ipackets: Total ipackets from last sample (for logging)
+# Uses expect scripts consistent with the main binary search approach
 # =============================================================================
 
-- name: Initialize multi-sample collection
-  ansible.builtin.set_fact:
-    sample_losses: []
-    sample_opackets_list: []
-    sample_ipackets_list: []
-    _sample_count: "{{ sample_count | default(3) }}"
-    _sample_duration: "{{ sample_duration | default(20) }}"
-    _sample_pause: "{{ sample_pause_sec | default(5) }}"
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Create expect script"
+  ansible.builtin.copy:
+    dest: "/tmp/trex_sample_{{ sample_num }}.exp"
+    content: |
+      #!/usr/bin/expect -f
+      set timeout {{ (_sample_duration | int) + 30 }}
+      log_user 1
 
-- name: "Multi-sample: Running {{ _sample_count }} samples at {{ sample_rate_gbps }} Gbps"
+      cd {{ trex_install_dir }}
+      spawn ./trex-console
+
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT waiting for prompt"; exit 1 }
+      }
+
+      # Reset ports
+      send "reset\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after reset"; exit 1 }
+      }
+
+      # Enable promiscuous mode
+      send "portattr -a --prom on\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after portattr"; exit 1 }
+      }
+
+      # Start traffic
+      puts "Sample {{ sample_num }}: Starting at {{ sample_rate_gbps }} Gbps for {{ _sample_duration }}s..."
+      send "start -f {{ trex_install_dir }}/{{ traffic_profile_name }}.py -m {{ sample_rate_gbps }}gbps {{ profile_flags }} --force\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after start"; exit 1 }
+      }
+
+      # Wait for sample duration
+      sleep {{ _sample_duration }}
+
+      # Stop and get stats
+      send "stop\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after stop"; exit 1 }
+      }
+
+      send "stats -a\r"
+      expect {
+        "trex>" {}
+        timeout { puts "TIMEOUT after stats"; exit 1 }
+      }
+
+      # Release and quit
+      send "release\r"
+      sleep 1
+      send "quit\r"
+      expect eof
+    mode: '0755'
+  delegate_to: "{{ groups['trex_server'][0] }}"
+
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Execute traffic"
+  ansible.builtin.shell: |
+    /usr/bin/expect /tmp/trex_sample_{{ sample_num }}.exp
+  args:
+    executable: /bin/bash
+    chdir: "{{ trex_install_dir }}"
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  register: sample_output
+  ignore_errors: yes
+
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Parse results"
+  vars:
+    stdout_text: "{{ sample_output.stdout | default('') }}"
+    opackets_match: "{{ stdout_text | regex_search('opackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+    ipackets_match: "{{ stdout_text | regex_search('ipackets\\s+\\|\\s+(\\d+)', '\\1') }}"
+  ansible.builtin.set_fact:
+    _sample_opackets: "{{ opackets_match[0] | default('0') | int }}"
+    _sample_ipackets: "{{ ipackets_match[0] | default('0') | int }}"
+
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Calculate and store loss"
+  vars:
+    loss_pct: "{{ (((_sample_opackets | int) - (_sample_ipackets | int)) / (_sample_opackets | int) * 100) if (_sample_opackets | int) > 0 else 100.0 }}"
+  ansible.builtin.set_fact:
+    sample_losses: "{{ sample_losses + [loss_pct | float | round(4)] }}"
+    sample_opackets_list: "{{ sample_opackets_list + [_sample_opackets | string] }}"
+    sample_ipackets_list: "{{ sample_ipackets_list + [_sample_ipackets | string] }}"
+
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Display result"
   ansible.builtin.debug:
-    msg: "Each sample: {{ _sample_duration }}s duration, collecting median to filter noise"
+    msg: "Sample {{ sample_num }}: Loss = {{ sample_losses[-1] }}%"
 
-- name: Run sample measurements
-  ansible.builtin.include_tasks: multi_sample_single.yml
-  loop: "{{ range(1, (_sample_count | int) + 1) | list }}"
-  loop_control:
-    loop_var: sample_num
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Cleanup expect script"
+  ansible.builtin.file:
+    path: "/tmp/trex_sample_{{ sample_num }}.exp"
+    state: absent
+  delegate_to: "{{ groups['trex_server'][0] }}"
+  ignore_errors: yes
 
-- name: Sort sample results for median calculation
-  ansible.builtin.set_fact:
-    sorted_losses: "{{ sample_losses | map('float') | sort | list }}"
-
-- name: Calculate median loss
-  ansible.builtin.set_fact:
-    multi_sample_loss_pct: >-
-      {%- set n = sorted_losses | length -%}
-      {%- if n == 0 -%}
-        100.0
-      {%- elif n % 2 == 1 -%}
-        {{ sorted_losses[(n // 2)] }}
-      {%- else -%}
-        {{ ((sorted_losses[(n // 2) - 1] | float) + (sorted_losses[(n // 2)] | float)) / 2 }}
-      {%- endif -%}
-
-- name: Store packet counts from last sample (for logging compatibility)
-  ansible.builtin.set_fact:
-    multi_sample_opackets: "{{ sample_opackets_list[-1] | default('0') }}"
-    multi_sample_ipackets: "{{ sample_ipackets_list[-1] | default('0') }}"
-
-- name: Calculate sample statistics
-  when: sample_losses | length > 1
-  block:
-    - name: Calculate mean and variance
-      vars:
-        losses_float: "{{ sample_losses | map('float') | list }}"
-        sample_mean: "{{ (losses_float | sum) / (losses_float | length) }}"
-        squared_sum: "{{ losses_float | map('pow', 2) | sum }}"
-        variance: "{{ (squared_sum | float / (losses_float | length)) - ((sample_mean | float) ** 2) }}"
-      ansible.builtin.set_fact:
-        multi_sample_mean: "{{ sample_mean }}"
-        multi_sample_stddev: "{{ ((variance | float | abs) ** 0.5) }}"
-
-    - name: Classify variance level
-      ansible.builtin.set_fact:
-        multi_sample_variance: >-
-          {%- set mean_val = multi_sample_mean | float -%}
-          {%- set cv = (multi_sample_stddev | float / mean_val * 100) if mean_val > 0.001 else 0 -%}
-          {%- if cv < 20 -%}low
-          {%- elif cv < 50 -%}medium
-          {%- else -%}high
-          {%- endif -%}
-
-- name: Set variance to low for single sample
-  when: sample_losses | length <= 1
-  ansible.builtin.set_fact:
-    multi_sample_variance: "low"
-    multi_sample_mean: "{{ multi_sample_loss_pct }}"
-    multi_sample_stddev: 0
-
-- name: Store multi-sample results
-  ansible.builtin.set_fact:
-    multi_sample_results:
-      rate_gbps: "{{ sample_rate_gbps }}"
-      samples: "{{ sample_losses }}"
-      median_loss_pct: "{{ multi_sample_loss_pct | float | round(4) }}"
-      mean_loss_pct: "{{ multi_sample_mean | float | round(4) }}"
-      stddev: "{{ multi_sample_stddev | float | round(4) }}"
-      variance_level: "{{ multi_sample_variance }}"
-
-- name: Display multi-sample results
-  ansible.builtin.debug:
-    msg:
-      - "----------------------------------------------------"
-      - "Multi-sample @ {{ sample_rate_gbps }} Gbps complete"
-      - "  Samples:  {{ sample_losses | map('round', 4) | list }}"
-      - "  Median:   {{ multi_sample_loss_pct | float | round(4) }}%"
-      - "  Mean:     {{ multi_sample_mean | float | round(4) }}%"
-      - "  StdDev:   {{ multi_sample_stddev | float | round(4) }}"
-      - "  Variance: {{ multi_sample_variance | upper }}"
-      - "----------------------------------------------------"
+- name: "Sample {{ sample_num }}/{{ _sample_count }} - Brief pause between samples"
+  ansible.builtin.pause:
+    seconds: "{{ _sample_pause | default(5) }}"
+  when: sample_num | int < (_sample_count | int)

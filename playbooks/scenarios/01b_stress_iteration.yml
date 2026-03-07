@@ -24,7 +24,7 @@
       -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
   args:
     # Use your new MikroTik-specific project directory
-    chdir: /opt/mikrotik-perfomance-validation 
+    chdir: /home/scadmin/mikrotik-perfomance-validation 
   async: "{{ (stress_duration | int) + 90 }}"
   poll: 0
   register: stress_monitor_job

@@ -24,7 +24,7 @@
       -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
   args:
     # Adjusted for your MikroTik project directory
-    chdir: /opt//mikrotik-perfomance-validation
+    chdir: /home/scadmin/mikrotik-perfomance-validation
   async: "{{ (observer_duration | int) + 90 }}"
   poll: 0
   register: observer_monitor_job

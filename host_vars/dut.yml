@@ -59,14 +59,9 @@ session_target_cps: 2000
 # This acts as the Single Source of Truth for "Pass/Fail" in reports.
 # -----------------------------------------------------------------
 
-binary_search_loss_pct: 0.00242           # ITU-T Y.1564 standard for "Service Activation Testing" +0.1% for baseline noise
-validation_loss_pct: 0.336  # Update this based on S01b results
-
-# Define your mode-specific factors
-#safe_validation_factor_sdwan: 0.86
-#safe_validation_factor_dia: 0.86
+binary_search_loss_pct: 0.1100           # ITU-T Y.1564 standard for "Service Activation Testing" +0.1% for baseline noise
+validation_loss_pct: 0.300  # Update this based on S01b results
 
 # Dynamic Selector
 # This variable changes value automatically based on the active test mode.
-safe_validation_factor: 0.85 #"{{ safe_validation_factor_sdwan if test_mode|default('') == 'sdwan' else safe_validation_factor_dia }}"
-
+safe_validation_factor: 0.89 
