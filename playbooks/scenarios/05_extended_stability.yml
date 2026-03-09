@@ -1,0 +1,253 @@
+# Scenario 5 - Extended Stability (Soak Test)
+# Validates sustained load performance and checks for memory leaks
+
+- name: Scenario 5 - Extended Stability
+  hosts: localhost
+  gather_facts: no
+  become: false
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+    - ../../inventory/group_vars/trex_server.yml
+    - ../../inventory/group_vars/app_server.yml
+  vars:
+    # [ALIGNED] Timestamp base path strategy
+    results_dir_base: "{{ results_base_dir }}/extended_stability_{{ test_mode }}"
+
+  pre_tasks:
+    - name: S5 - Set default test mode if undefined
+      ansible.builtin.set_fact:
+        test_mode: "standalone"
+      when: test_mode is not defined
+
+    - name: S5 - Gather facts for timestamps
+      ansible.builtin.setup:
+          gather_subset:
+            - '!all'
+            - 'date_time'
+
+    - name: S5 - Set unique results directory with timestamp
+      ansible.builtin.set_fact:
+        test_mode_results_dir: "{{ results_dir_base }}_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: S5 PRE-TASK - Create results directory
+      ansible.builtin.file:
+        path: "{{ test_mode_results_dir }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+    # -----------------------------------------------------------------
+    # Robust Duration Calculation
+    # We cast to 'string' before checking for 'h' to handle Integers (720) safely
+    # -----------------------------------------------------------------
+    - name: S5 PRE-TASK - Calculate duration in seconds
+      ansible.builtin.set_fact:
+        stability_duration_sec: "{{ (stability_test_duration | regex_replace('h$', '') | int * 3600) if 'h' in (stability_test_duration | string) else stability_test_duration | int }}"
+
+    - name: S5 PRE-TASK - Identify DUT Hostname
+      ansible.builtin.set_fact:
+        dut_hostname: "{{ groups['versa_dut'][0] }}"
+
+    # -----------------------------------------------------------------
+    # Robust Variable Loading
+    # This ensures we get the correct Max Bandwidth limits for the Binary Search
+    # -----------------------------------------------------------------
+    - name: S5 PRE-TASK - Load T-Rex Defaults
+      ansible.builtin.include_vars:
+        file: "../../inventory/group_vars/trex_server.yml"
+        name: trex_defaults
+
+    - name: S5 PRE-TASK - Load DUT Host Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    - name: S5 PRE-TASK - Load Platform Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ platform_name }}.yml"
+      ignore_errors: yes
+
+    - name: S5 PRE-TASK - Extract Infrastructure Variables
+      ansible.builtin.set_fact:
+        dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
+
+        # Binary Search Limits - Logic: DUT > Platform > T-Rex Default
+        # This fixes the issue of starting at 5Gbps if your hardware is smaller
+        binary_search_max_imix_gbps: "{{ binary_search_max_imix_gbps | default(trex_defaults['binary_search_max_imix_gbps']) | default(2.0) }}"
+
+        # Other Trex params
+        trex_ip: "{{ hostvars[groups['trex_server'][0]]['trex_ip'] }}"
+        app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+        
+        # [UPDATED] Dynamically pull interface name from app_server group vars
+        app_server_base_if: "{{ hostvars[groups['app_server'][0]]['app_server_base_if'] }}"
+
+    # -----------------------------------------------------------------------
+    # XDP Reflector Setup
+    # -----------------------------------------------------------------------
+    - name: S5 PRE-TASK - Check if XDP reflector binary exists
+      ansible.builtin.stat:
+        path: /opt/scripts/xdp_loader
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: xdp_binary
+
+    - name: S5 PRE-TASK - Fail if XDP reflector not found
+      ansible.builtin.fail:
+        msg: "XDP reflector not found. Please compile it first."
+      when: not xdp_binary.stat.exists
+
+    - name: S5 PRE-TASK - Kill any existing XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off || true"
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S5 PRE-TASK - Start XDP reflector
+      ansible.builtin.shell: |
+        nohup sudo /opt/scripts/xdp_loader -i {{ app_server_base_if }} > /tmp/xdp_reflect_s5.log 2>&1 &
+      args:
+        chdir: /opt/scripts
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S5 PRE-TASK - Wait for XDP reflector to initialize
+      ansible.builtin.pause:
+        seconds: 3
+
+  tasks:
+    
+
+    
+
+    - name: S5 - Find standalone max throughput
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "imix"
+        binary_search_max_gbps: "{{ binary_search_max_imix_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+
+    - name: S5 - Store discovered max rate
+      ansible.builtin.set_fact:
+        max_standalone_rate: "{{ gbps | default(0) }}"
+
+    - name: S5 - Calculate 80% stability test load
+      ansible.builtin.set_fact:
+        stability_load_gbps: "{{ (max_standalone_rate | float * stability_test_load_factor) | round(2) }}"
+
+    - name: S5 - Start DUT monitoring in background
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ stability_duration_sec }}" \
+          -e "monitor_interval_sec={{ stability_monitor_interval_sec }}" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s5_stability_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}"
+      args:
+        chdir: /home/scadmin/mikrotik-perfomance-validation
+      async: "{{ stability_duration_sec | int + 60 }}"
+      poll: 0
+      register: dut_monitor
+
+    - name: S5 - Run T-Rex Extended Stability Test
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        traffic_profile_name: "imix"
+        duration: "{{ stability_duration_sec }}"
+        rate_gbps: "{{ stability_load_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s5_stability_trex.log"
+      register: trex_stability_test
+
+    - name: S5 - Wait for DUT monitoring to finish
+      ansible.builtin.async_status:
+        jid: "{{ dut_monitor.ansible_job_id }}"
+      register: dut_monitor_result
+      until: dut_monitor_result.finished
+      retries: "{{ (stability_duration_sec | int / 60) | int + 10 }}"
+      delay: 60
+
+    - name: S5 - Save test summary
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "05_extended_stability",
+            "test_mode": "{{ test_mode }}",
+            "wan_paths_enabled": 1,
+            "max_rate_gbps": {{ max_standalone_rate }},
+            "stability_load_gbps": {{ stability_load_gbps }},
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s5_stability_summary.json"
+        mode: '0644'
+
+    # ============================================================================
+    # S05 PARSE RESULTS TASK
+    # ============================================================================
+
+    - name: S5 - Parse and enrich stability results
+      ansible.builtin.command:
+        cmd: >
+          python3 {{ playbook_dir }}/../../scripts/analysis/parse_s05_results.py
+          {{ test_mode_results_dir }}
+          --max-loss 0.5
+          --max-cpu-drift 10.0
+          --max-mem-drift 5.0
+        chdir: "{{ playbook_dir }}/.."
+      register: parse_result
+      delegate_to: localhost
+      become: false
+
+    - name: S5 - Display parsing summary
+      ansible.builtin.debug:
+        msg: "{{ parse_result.stdout_lines }}"
+
+    - name: S5 - Load enriched summary
+      ansible.builtin.slurp:
+        src: "{{ test_mode_results_dir }}/s05_summary.json"
+      register: s05_summary_raw
+      delegate_to: localhost
+      become: false
+
+    - name: S5 - Parse summary JSON
+      ansible.builtin.set_fact:
+        s05_summary: "{{ s05_summary_raw.content | b64decode | from_json }}"
+
+    - name: S5 - Display stability test results
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "═══════════════════════════════════════════════════════════════"
+          - "  EXTENDED STABILITY TEST COMPLETE - {{ test_mode | upper }} MODE"
+          - "═══════════════════════════════════════════════════════════════"
+          - ""
+          - "Test Duration: {{ s05_summary.summary.test_duration_minutes }} minutes"
+          - "Samples: {{ s05_summary.summary.samples }}"
+          - ""
+          - "Traffic Statistics:"
+          - "  TX Packets:   {{ s05_summary.summary.tx_packets }}"
+          - "  RX Packets:   {{ s05_summary.summary.rx_packets }}"
+          - "  Packet Loss:  {{ s05_summary.summary.packet_loss }} ({{ s05_summary.summary.packet_loss_pct }}%)"
+          - ""
+          - "Stability Metrics:"
+          - "  CPU: avg={{ s05_summary.summary.cpu_avg }}%, max={{ s05_summary.summary.cpu_max }}%, drift={{ s05_summary.summary.cpu_drift }}%"
+          - "  Mem: avg={{ s05_summary.summary.mem_avg }}%, max={{ s05_summary.summary.mem_max }}%, drift={{ s05_summary.summary.mem_drift }}%"
+          - ""
+          - "Result: {{ 'PASS' if s05_summary.summary.pass else 'FAIL' }}"
+          - ""
+          - "Results saved to: {{ test_mode_results_dir }}/"
+
+  post_tasks:
+    - name: S5 POST-TASK - Detach XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      changed_when: false
+      failed_when: false

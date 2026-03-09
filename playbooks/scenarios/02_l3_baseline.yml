@@ -1,16 +1,17 @@
 # Scenario 2 - L3 Baseline (MikroTik RouterOS Performance Validation)
 # Tests basic L3 forwarding performance with a single path
 
-- name: Scenario 2 - L3 Baseline standalone mode
+- name: Scenario 2 - L3 Baseline MikroTik Standalone
   hosts: localhost
   gather_facts: no
   vars_files:
     - ../../inventory/group_vars/all.yml
   vars:
-    results_dir_base: "{{ results_base_dir }}/l3_baseline_standalone"
+    results_dir_base: "{{ results_base_dir }}/l3_baseline_mikrotik"
     large_packet_size: "{{ large_packet_size_traffic | default(1500) }}"
     large_packet_label: "{{ large_packet_size }}b"
     validation_duration_sec: 60
+    test_mode: "standalone"
 
   pre_tasks:
     - name: S2 - Gather facts for timestamps
@@ -40,7 +41,7 @@
     # 2. Identify DUT and Platform
     - name: S2 PRE-TASK - Identify DUT Hostname
       ansible.builtin.set_fact:
-        dut_hostname: "{{ groups['versa_duts'][0] }}"
+        dut_hostname: "{{ groups['mikrotik_dut'][0] }}"
 
     # 3. Load DUT Variables (Priority 1 - sets platform_name)
     - name: S2 PRE-TASK - Load DUT Host Variables (Get Platform)
@@ -73,6 +74,9 @@
         # App Server Info
         app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
         app_server_base_if: "{{ hostvars[groups['app_server'][0]]['app_server_base_if'] }}"
+
+        # Define the Gateway IP required for T-Rex roles
+        dut_trex_lan_ip: "{{ hostvars[dut_hostname]['dut_trex_lan_ip'] }}"
 
         # Binary Search Limits (Logic: DUT > Platform > T-Rex Default)
         binary_search_max_gbps: "{{ binary_search_max_gbps | default(trex_defaults['binary_search_max_gbps']) | default(10.0) }}"
@@ -152,37 +156,6 @@
       ansible.builtin.debug:
         msg: "Ping from T-Rex to App Server: {{ 'SUCCESS' if ping_app_from_trex.rc == 0 else 'FAILED' }}"
 
-  tasks:
-    - name: S2 - Set DUT to {{ test_mode }} mode
-      ansible.builtin.include_role:
-        name: 04_dut_control
-        tasks_from: set_test_mode.yml
-      vars:
-        mode: "{{ test_mode }}"
-        _current_run_dir: "{{ test_mode_results_dir }}"
-        ansible_host: "{{ dut_ansible_host }}"
-        ansible_user: "{{ dut_ansible_user }}"
-        ansible_ssh_pass: "{{ dut_ansible_ssh_pass }}"
-        versa_org_name: "{{ hostvars[dut_hostname]['versa_org_name'] }}"
-        versa_sdwan_policy_name: "{{ hostvars[dut_hostname]['versa_sdwan_policy_name'] }}"
-        versa_sdwan_rule_name: "{{ hostvars[dut_hostname]['versa_sdwan_rule_name'] }}"
-        versa_dia_rule_name: "{{ hostvars[dut_hostname]['versa_dia_rule_name'] }}"
-      when: test_mode != 'standalone'
-
-    - name: S2 - Enable single WAN path (VLAN 100)
-      ansible.builtin.include_role:
-        name: 04_dut_control
-        tasks_from: enable_paths.yml
-      vars:
-        paths_to_enable: 1
-        mode: "{{ test_mode }}"
-        _current_run_dir: "{{ test_mode_results_dir }}"
-        ansible_host: "{{ dut_ansible_host }}"
-        ansible_user: "{{ dut_ansible_user }}"
-        ansible_ssh_pass: "{{ dut_ansible_ssh_pass }}"
-        wan_vlans: "{{ hostvars[dut_hostname]['wan_vlans'] }}"
-      when: test_mode != 'standalone'
-
     # ========================================================================
     # TEST 1: 64 BYTES
     # ========================================================================
@@ -216,16 +189,14 @@
           -e "ansible_host={{ dut_ansible_host }}" \
           -e "ansible_user={{ dut_ansible_user }}" \
           -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
-          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
-          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
           -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
           -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
       args:
-        chdir: /opt/versa-sdwan-performance-test
+        chdir: /home/scadmin/mikrotik-perfomance-validation  
       async: "{{ (validation_duration_sec | int * 3) + 60 }}"
       poll: 0
       register: monitor_64b
-      become: false # Ensure local monitoring runs as ubuntu
+      become: false
 
     - name: S2 - Run 64b validation test at max rate
       ansible.builtin.include_role:
@@ -297,12 +268,10 @@
           -e "ansible_host={{ dut_ansible_host }}" \
           -e "ansible_user={{ dut_ansible_user }}" \
           -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
-          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
-          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
           -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
           -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
       args:
-        chdir: /opt/versa-sdwan-performance-test
+        chdir: /home/scadmin/mikrotik-perfomance-validation
       async: "{{ (validation_duration_sec | int * 3) + 60 }}"
       poll: 0
       register: monitor_512b
@@ -378,12 +347,10 @@
           -e "ansible_host={{ dut_ansible_host }}" \
           -e "ansible_user={{ dut_ansible_user }}" \
           -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
-          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
-          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
           -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
           -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
       args:
-        chdir: /opt/versa-sdwan-performance-test
+        chdir: /home/scadmin/mikrotik-perfomance-validation
       async: "{{ (validation_duration_sec | int * 3) + 60 }}"
       poll: 0
       register: monitor_large
@@ -460,12 +427,10 @@
           -e "ansible_host={{ dut_ansible_host }}" \
           -e "ansible_user={{ dut_ansible_user }}" \
           -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
-          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
-          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
           -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
-          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}" 
       args:
-        chdir: /opt/versa-sdwan-performance-test
+        chdir: /home/scadmin/mikrotik-perfomance-validation
       async: "{{ (validation_duration_sec | int * 3) + 60 }}"
       poll: 0
       register: monitor_imix
@@ -521,7 +486,7 @@
         chdir: "{{ playbook_dir }}/.."
       register: parse_result
       delegate_to: localhost
-      become: false
+      become: true
 
     - name: S2 - Display parsing summary
       ansible.builtin.debug:

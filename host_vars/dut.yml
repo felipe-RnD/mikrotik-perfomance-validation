@@ -59,7 +59,7 @@ session_target_cps: 2000
 # This acts as the Single Source of Truth for "Pass/Fail" in reports.
 # -----------------------------------------------------------------
 
-binary_search_loss_pct: 0.1100           # ITU-T Y.1564 standard for "Service Activation Testing" +0.1% for baseline noise
+binary_search_loss_pct: 0.0011           # ITU-T Y.1564 standard for "Service Activation Testing" +0.1% for baseline noise
 validation_loss_pct: 0.300  # Update this based on S01b results
 
 # Dynamic Selector

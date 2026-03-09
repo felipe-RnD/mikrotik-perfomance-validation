@@ -1,0 +1,273 @@
+# Scenario 3 - Consolidated Scaling & Quality Test
+# Tests how throughput, latency, load balancing, and application quality scale with WAN paths
+
+- name: Scenario 3 - Scaling & Quality
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+  vars:
+    results_dir_base: "{{ results_base_dir }}/scaling_quality_{{ test_mode }}"
+
+    # K6 Duration (Per Test) - We use this to calculate T-Rex duration
+    test_duration_k6_sec: 60
+
+    # T-Rex Load Factor
+    scaling_test_load_factor: 0.70
+    monitor_interval_sec: 10
+
+  pre_tasks:
+    - name: S3 - Set default test mode if undefined
+      ansible.builtin.set_fact:
+        test_mode: "standalone"
+      when: test_mode is not defined
+
+    - name: S3 PRE-TASK - Set default path counts if undefined
+      ansible.builtin.set_fact:
+        test_path_counts: [1, 2, 4, 8, 14]
+      when: test_path_counts is not defined
+
+    - name: S3 - Gather facts for timestamps
+      ansible.builtin.setup:
+          gather_subset:
+            - '!all'
+            - 'date_time'
+
+    - name: S3 - Set unique results directory with timestamp
+      ansible.builtin.set_fact:
+        test_mode_results_dir: "{{ results_dir_base }}_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: S3 PRE-TASK - Create results directory
+      ansible.builtin.file:
+        path: "{{ test_mode_results_dir }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+    # -----------------------------------------------------------------------
+    # Variable Loading Strategy
+    # -----------------------------------------------------------------------
+    - name: S3 PRE-TASK - Load T-Rex Defaults
+      ansible.builtin.include_vars:
+        file: "../../inventory/group_vars/trex_server.yml"
+        name: trex_defaults
+
+    - name: S3 PRE-TASK - Load K6 Defaults
+      ansible.builtin.include_vars:
+        file: "../../inventory/group_vars/k6_server.yml"
+        name: k6_defaults
+
+    - name: S3 PRE-TASK - Identify DUT Hostname
+      ansible.builtin.set_fact:
+        dut_hostname: "{{ groups['mikrotik_dut'][0] }}"
+
+    - name: S3 PRE-TASK - Load DUT Host Variables (1st Pass)
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    - name: S3 PRE-TASK - Load Platform Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ platform_name }}.yml"
+      ignore_errors: yes
+
+    - name: S3 PRE-TASK - Load DUT Host Variables (2nd Pass)
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    - name: S3 PRE-TASK - Extract Infrastructure Variables
+      ansible.builtin.set_fact:
+        # T-Rex
+        trex_ip: "{{ hostvars[groups['trex_server'][0]]['trex_ip'] }}"
+        trex_install_dir: "{{ trex_defaults['trex_install_dir'] }}"
+
+        # Binary Search (Using Trex Defaults)
+        binary_search_min_gbps: "{{ binary_search_min_gbps | default(trex_defaults['binary_search_min_gbps']) | default(0.01) }}"
+        binary_search_resolution_gbps: "{{ binary_search_resolution_gbps | default(trex_defaults['binary_search_resolution_gbps']) | default(0.005) }}"
+        binary_search_duration_sec: "{{ binary_search_duration_sec | default(trex_defaults['binary_search_duration_sec']) | default(60) }}"
+        binary_search_loss_pct: "{{ binary_search_loss_pct | default(trex_defaults['binary_search_loss_pct']) | default(0.003) }}"
+        binary_search_max_imix_gbps: "{{ binary_search_max_imix_gbps | default(trex_defaults['binary_search_max_imix_gbps']) | default(2.0) }}"
+
+        # K6
+        k6_binary_path: "{{ k6_defaults['k6_binary_path'] }}"
+        k6_scripts_dir: "{{ k6_defaults['k6_scripts_dir'] }}"
+        k6_results_dir: "{{ k6_defaults['k6_results_dir'] }}"
+        k6_vus_http: "{{ k6_vus_http | default(k6_defaults['k6_vus_http']) | default(10) }}"
+        k6_vus_db: "{{ k6_vus_db | default(k6_defaults['k6_vus_db']) | default(5) }}"
+        k6_target_endpoint_db: "http://{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}:5000/db/query"
+
+        # App Server
+        app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+        app_server_base_url: "http://{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+        
+        # [UPDATED] Dynamically pull interface name from app_server group vars
+        app_server_base_if: "{{ hostvars[groups['app_server'][0]]['app_server_base_if'] }}"
+
+    # -----------------------------------------------------------------------
+    # Dynamic Duration Calculation
+    # -----------------------------------------------------------------------
+    - name: S3 PRE-TASK - Calculate T-Rex Duration
+      ansible.builtin.set_fact:
+        # Logic: Wait (10s) + HTTP Test + DB Test + Buffer (60s for overhead)
+        scaling_test_duration: "{{ (10 + (test_duration_k6_sec | int) + (test_duration_k6_sec | int) + 60) | int }}"
+
+    - name: S3 - Set DUT connection facts
+      ansible.builtin.set_fact:
+        dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
+
+    - name: S3 PRE-TASK - Display test configuration
+      ansible.builtin.debug:
+        msg:
+          - "[SCENARIO 3 - SCALING & QUALITY]"
+          - ""
+          - "Test Mode: {{ test_mode }}"
+          - "DUT Profile: {{ dut_current_profile | default('Unknown') }}"
+          - "Platform: {{ platform_name }}"
+          - "IMIX Max Ceiling: {{ binary_search_max_imix_gbps }} Gbps"
+          - "Acceptable Loss: {{ binary_search_loss_pct }} ({{ (binary_search_loss_pct|float * 100)|round(2) }}%)"
+          - "Target Load: {{ scaling_test_load_factor * 100 }}%"
+          - "K6 Duration (per test): {{ test_duration_k6_sec }}s"
+          - "T-Rex Duration (calculated): {{ scaling_test_duration }}s"
+          - "App Server IF: {{ app_server_base_if }}"
+          - "Starting XDP Reflector validation..."
+
+    # -----------------------------------------------------------------------
+    # XDP Reflector Setup
+    # -----------------------------------------------------------------------
+    - name: S3 PRE-TASK - Check if XDP reflector binary exists
+      ansible.builtin.stat:
+        path: /opt/scripts/xdp_loader
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: xdp_binary
+
+    - name: S3 PRE-TASK - Fail if XDP reflector not found
+      ansible.builtin.fail:
+        msg: "XDP reflector not found at /opt/scripts/xdp_loader. Please compile it first."
+      when: not xdp_binary.stat.exists
+
+    - name: S3 PRE-TASK - Kill any existing XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off || true"
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S3 PRE-TASK - Start XDP reflector
+      ansible.builtin.shell: |
+        nohup sudo /opt/scripts/xdp_loader -i {{ app_server_base_if }} > /tmp/xdp_reflect_s3.log 2>&1 &
+      args:
+        chdir: /opt/scripts
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S3 PRE-TASK - Wait for XDP reflector to initialize
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: S3 PRE-TASK - Verify XDP reflector is ATTACHED
+      ansible.builtin.shell: "ip link show dev {{ app_server_base_if }}"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: ip_link_output
+      until: ip_link_output.stdout is defined and ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)')
+      retries: 3
+      delay: 2
+      failed_when: not (ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)'))
+
+    # -----------------------------------------------------------------------
+    # K6 Connectivity Validation
+    # -----------------------------------------------------------------------
+    - name: S3 PRE-TASK - Verify K6 connectivity to App Server
+      ansible.builtin.shell: "ping -c 3 -W 2 {{ app_server_ip }}"
+      delegate_to: "{{ groups['k6_server'][0] }}"
+      register: ping_k6_app
+      failed_when: ping_k6_app.rc != 0
+
+    - name: S3 PRE-TASK - Display K6 connectivity
+      ansible.builtin.debug:
+        msg: "K6 -> App Server Connectivity: OK"
+
+  tasks:
+    - name: S3 - Run Scaling and Quality Test (Single Path)
+      ansible.builtin.include_tasks: 03_scaling_iteration.yml
+      vars:
+        path_count: 1
+        results_prefix: "{{ test_mode_results_dir }}/s3_scale_standalone"
+
+    # ========================================================================
+    # POST-PROCESSING: Parse and Enrich Results
+    # ========================================================================
+
+    - name: S3 - Parse and enrich all path count results
+      ansible.builtin.command:
+        # [FIX] Added ../../ to correctly reach scripts directory
+        cmd: >
+          python3 {{ playbook_dir }}/../../scripts/analysis/parse_s03_results.py
+          {{ test_mode_results_dir }}
+          --loss-threshold 0.5
+          --latency-threshold 200
+        chdir: "{{ playbook_dir }}/.."
+      register: parse_result
+      delegate_to: localhost
+      become: false
+
+    - name: S3 - Display parsing summary
+      ansible.builtin.debug:
+        msg: "{{ parse_result.stdout_lines }}"
+
+    - name: S3 - Load enriched summary
+      ansible.builtin.slurp:
+        src: "{{ test_mode_results_dir }}/s03_summary.json"
+      register: s03_summary_raw
+      delegate_to: localhost
+      become: false
+
+    - name: S3 - Parse summary JSON
+      ansible.builtin.set_fact:
+        s03_summary: "{{ s03_summary_raw.content | b64decode | from_json }}"
+
+    - name: S3 - Display scaling analysis
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "═══════════════════════════════════════════════════════════════════════════════"
+          - "  SCALING AND QUALITY TEST COMPLETE - {{ test_mode | upper }} MODE"
+          - "═══════════════════════════════════════════════════════════════════════════════"
+          - ""
+          - "DUT Profile: {{ dut_current_profile | default('Unknown') }}"
+          - "Platform: {{ platform_name }}"
+          - ""
+          - "Scaling Results ({{ s03_summary.summary.path_counts_tested }} path counts tested):"
+          - "  Passed: {{ s03_summary.summary.passed }}"
+          - "  Failed: {{ s03_summary.summary.failed }}"
+          - ""
+          - "Path  MaxRate    BgLoad    Loss%   HTTP P95   DB P95    CPU%   Status"
+          - "───────────────────────────────────────────────────────────────────────"
+
+    - name: S3 - Display per-path results
+      ansible.builtin.debug:
+        msg: "{{ item.path_count }}     {{ item.max_rate_gbps }}      {{ item.background_load_gbps }}     {{ item.trex_loss_pct | default(0) | round(2) }}%   {{ item.http_p95_ms | default(0) | round(1) }}ms    {{ item.db_p95_ms | default(0) | round(1) }}ms   {{ item.cpu_avg | default(0) | round(1) }}%   {{ 'PASS' if item.pass else 'FAIL' }}"
+      loop: "{{ s03_summary.scaling_analysis }}"
+      loop_control:
+        label: "{{ item.path_count }} paths"
+
+    - name: S3 - Display results location
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "Results saved to: {{ test_mode_results_dir }}/"
+          - "  - s03_summary.json (consolidated)"
+          - "  - s3_scale_*path_enriched.json (per path count)"
+          - ""
+
+  post_tasks:
+    - name: S3 POST-TASK - Detach XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      changed_when: false
+      failed_when: false
+
+    - name: S3 POST-TASK - Verify connectivity after shutdown
+      ansible.builtin.shell: "ping -c 3 {{ app_server_ip }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: final_ping
+      failed_when: false
+    - name: S3 POST-TASK - Display final connectivity status
+      ansible.builtin.debug:
+        msg: "Connectivity after XDP reflector shutdown: {{ 'OK' if final_ping.rc == 0 else 'CHECK MANUALLY' }}"

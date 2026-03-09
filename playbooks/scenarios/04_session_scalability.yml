@@ -1,0 +1,259 @@
+# Scenario 4 - Session Scalability Test
+# Isolates session table capacity and setup performance
+
+- name: Scenario 4 - Session Scalability
+  hosts: localhost
+  gather_facts: no
+  become: false
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+    - ../../inventory/group_vars/trex_server.yml
+    - ../../inventory/group_vars/app_server.yml
+  vars:
+    results_dir_base: "{{ results_base_dir }}/session_scalability_{{ test_mode }}"
+
+    # Session test parameters
+    session_test_duration_sec: 600  # 10 minutes
+
+    # In ASTF mode, this value acts as the Multiplier (-m)
+    session_test_rate_mult: 1
+    session_monitor_interval_sec: 30
+
+  pre_tasks:
+    - name: S4 - Set default test mode if undefined
+      ansible.builtin.set_fact:
+        test_mode: "standalone"
+      when: test_mode is not defined
+
+    - name: S4 - Gather facts for timestamps
+      ansible.builtin.setup:
+          gather_subset:
+            - '!all'
+            - 'date_time'
+
+    - name: S4 - Set unique results directory with timestamp
+      ansible.builtin.set_fact:
+        test_mode_results_dir: "{{ results_dir_base }}_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: S4 PRE-TASK - Create results directory
+      ansible.builtin.file:
+        path: "{{ test_mode_results_dir }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+    # -----------------------------------------------------------------------
+    # Variable Loading Section
+    # -----------------------------------------------------------------------
+    - name: S4 PRE-TASK - Identify DUT Hostname
+      ansible.builtin.set_fact:
+        dut_hostname: "{{ groups['mikrotik_dut'][0] }}"
+
+    - name: S4 PRE-TASK - Load DUT Host Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    - name: S4 PRE-TASK - Load Platform Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ platform_name }}.yml"
+
+    - name: S4 - Set DUT connection facts
+      ansible.builtin.set_fact:
+        dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
+
+    # -----------------------------------------------------------------------
+    # Dynamic Session Ceiling Calculation
+    # -----------------------------------------------------------------------
+    - name: S4 PRE-TASK - Calculate Session Ceiling and Delay
+      ansible.builtin.set_fact:
+        # Priority: Run-specific limit (dut.yml) -> Platform limit (lanner_*.yml) -> Default
+        ceiling_sessions: "{{ target_max_sessions | default(platform_expected_max_sessions) | default(500000) }}"
+        
+        # [UPDATED] Use variable from dut.yml, default to 2000 if missing
+        target_cps_val: "{{ session_target_cps | default(2000) }}"
+
+    - name: S4 PRE-TASK - Calculate Effective Rates
+      ansible.builtin.set_fact:
+        # Effective Rate = Target CPS * Multiplier
+        effective_cps: "{{ target_cps_val | int * session_test_rate_mult | float }}"
+
+    - name: S4 PRE-TASK - Calculate Profile Delay
+      ansible.builtin.set_fact:
+        # Calculate required hold time: (Target Sessions / Rate) = Seconds
+        # Convert to Microseconds for T-Rex profile (x 1,000,000)
+        calculated_delay_usec: "{{ ((ceiling_sessions | int / effective_cps | float) * 1000000) | int }}"
+
+    - name: S4 PRE-TASK - Display test configuration
+      ansible.builtin.debug:
+        msg:
+          - "[SCENARIO 4 - SESSION SCALABILITY TEST]"
+          - ""
+          - "Test Mode: {{ test_mode }}"
+          - "Results Directory: {{ test_mode_results_dir }}"
+          - "DUT Platform: {{ platform_name }}"
+          - "Target Ceiling: {{ ceiling_sessions }} Sessions"
+          - "Target Rate: {{ effective_cps }} CPS"
+          - "Calculated Hold Time: {{ calculated_delay_usec | int / 1000000 }} seconds"
+          - "Test Duration: {{ session_test_duration_sec }}s"
+          - "Monitor Interval: {{ session_monitor_interval_sec }}s"
+          - ""
+
+  tasks:
+    - name: S4 - Start DUT monitoring in background
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ session_test_duration_sec }}" \
+          -e "monitor_interval_sec={{ session_monitor_interval_sec }}" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s4_session_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+      args:
+        chdir: /home/scadmin/mikrotik-perfomance-validation
+      async: "{{ session_test_duration_sec | int + 60 }}"
+      poll: 0
+      register: dut_monitor
+
+    - name: S4 - Run T-Rex Session Ramp Test
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        # Matches 'session' in name to trigger ASTF logic in start_test.yml
+        traffic_profile_name: "session_ramp"
+        duration: "{{ session_test_duration_sec }}"
+        # Passes 1.0 to -m flag
+        rate_gbps: "{{ session_test_rate_mult }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s4_session_ramp_trex.log"
+
+        # [CRITICAL] ASTF Profile Specific Variables
+        # Use the local variable we set in pre_tasks
+        session_max_cps: "{{ target_cps_val }}"
+        
+        # Pass the uniquely named variable to the template variable
+        session_delay_usec: "{{ calculated_delay_usec }}"
+        
+        profile_client_ip_start: "172.16.1.2"
+        profile_client_ip_end: "172.16.1.50"
+        profile_server_ip_start: "10.0.0.2"
+        profile_server_ip_end: "10.0.0.3"
+      register: trex_session_test
+
+    - name: S4 - Wait for DUT monitoring to finish
+      ansible.builtin.async_status:
+        jid: "{{ dut_monitor.ansible_job_id }}"
+      register: dut_monitor_result
+      until: dut_monitor_result.finished
+      retries: 30
+      delay: 20
+
+    - name: S4 - Save test summary
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "04_session_scalability",
+            "test_mode": "{{ test_mode }}",
+            "wan_paths_enabled": 14,
+            "test_duration_sec": {{ session_test_duration_sec }},
+            "multiplier": {{ session_test_rate_mult }},
+            "target_cps": {{ target_cps_val }},
+            "dut_monitoring_log": "s4_session_dut_monitor.log",
+            "trex_profile": "session_ramp (ASTF)",
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s4_session_summary.json"
+        mode: '0644'
+
+    # ============================================================================
+    # S04 PARSE RESULTS TASK
+    # ============================================================================
+
+    - name: S4 - Parse and enrich session results
+      ansible.builtin.command:
+        # [FIX] Added ../../ to correctly reach scripts directory
+        cmd: >
+          python3 {{ playbook_dir }}/../../scripts/analysis/parse_s04_results.py
+          {{ test_mode_results_dir }}
+          --min-success-rate 95.0
+        chdir: "{{ playbook_dir }}/.."
+      register: parse_result
+      delegate_to: localhost
+      become: false
+
+    - name: S4 - Display parsing summary
+      ansible.builtin.debug:
+        msg: "{{ parse_result.stdout_lines }}"
+
+    - name: S4 - Load enriched summary
+      ansible.builtin.slurp:
+        src: "{{ test_mode_results_dir }}/s04_summary.json"
+      register: s04_summary_raw
+      delegate_to: localhost
+      become: false
+
+    - name: S4 - Parse summary JSON
+      ansible.builtin.set_fact:
+        s04_summary: "{{ s04_summary_raw.content | b64decode | from_json }}"
+
+    - name: S4 - Display session scalability results
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "═══════════════════════════════════════════════════════════════"
+          - "  SESSION SCALABILITY TEST COMPLETE - {{ test_mode | upper }} MODE"
+          - "═══════════════════════════════════════════════════════════════"
+          - ""
+          - "Connection Statistics:"
+          - "  Attempted:    {{ s04_summary.summary.conn_attempted }}"
+          - "  Established:  {{ s04_summary.summary.conn_established }}"
+          - "  Success Rate: {{ s04_summary.summary.conn_success_rate }}%"
+          - "  Drops:        {{ s04_summary.summary.conn_drops }}"
+          - ""
+          - "DUT Metrics:"
+          - "  Peak Sessions:     {{ s04_summary.summary.peak_sessions }}"
+          - "  Peak TCP Sessions: {{ s04_summary.summary.peak_tcp_sessions }}"
+          - "  CPU at Peak:       {{ s04_summary.summary.cpu_at_peak }}%"
+          - "  Memory at Peak:    {{ s04_summary.summary.mem_at_peak }}%"
+          - ""
+          - "Result: {{ 'PASS' if s04_summary.summary.pass else 'FAIL' }}"
+          - ""
+          - "Results saved to: {{ test_mode_results_dir }}/"
+
+  post_tasks:
+    - name: S4 POST-TASK - Force stop ASTF service
+      ansible.builtin.systemd:
+        name: trex-astf
+        state: stopped
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      become: yes
+      ignore_errors: yes
+
+    - name: S4 POST-TASK - Cool-down for DPDK ports
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: S4 POST-TASK - Restart Standard T-Rex Service (STL)
+      ansible.builtin.systemd:
+        name: trex
+        state: started
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      become: yes
+
+    - name: S4 POST-TASK - Wait for T-Rex RPC (Verification)
+      ansible.builtin.wait_for:
+        port: 4501
+        host: "{{ hostvars[groups['trex_server'][0]]['ansible_host'] }}"
+        timeout: 30
+      delegate_to: localhost
+
+    - name: S4 POST-TASK - Wait for DUT to recover from crash
+      ansible.builtin.wait_for_connection:
+        delay: 60
+        timeout: 600
+      when: test_mode != 'standalone'

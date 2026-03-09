@@ -34,9 +34,9 @@ lab_ssh_user: "scadmin"
 app_server_ip: "10.0.0.2"
 cisco_vlan201_ip: "10.0.0.1"
 
-# DUT LAN Gateways (172.16.0.0/30 and 172.16.0.4/30, VLAN 200)
-dut_trex_lan_ip: "172.16.1.1"  # T-Rex gateway (VNI-0/3)
-dut_k6_lan_ip: "172.16.0.1"    # K6 gateway (VNI-0/2)
+# DUT LAN Gateways (172.16.0.0/30 and 172.16.0.4/30, VLAN 200,203)
+dut_trex_lan_ip: "172.16.1.1"  # T-Rex gateway (eth3)
+dut_k6_lan_ip: "172.16.0.1"    # K6 gateway (eth3)
 
 # Test Infrastructure IPs (172.16.0.0/30 and 172.16.0.4/30, VLAN 200)
 trex_ip: "172.16.1.2"   # T-Rex traffic generator
@@ -74,3 +74,4 @@ app_server_base_url: "http://{{ app_server_ip }}"
 
 # large_packet_size_sdwan: 1360    # Safe for IPsec tunnel encapsulation
 large_packet_size_traffic: 1472      # Max UDP payload without fragmentation
+
