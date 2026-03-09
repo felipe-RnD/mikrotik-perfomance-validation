@@ -1,0 +1,3 @@
+---
+- name: Get DUT VM Profile
+  ansible.builtin.include_tasks: get_vm_profile.yml

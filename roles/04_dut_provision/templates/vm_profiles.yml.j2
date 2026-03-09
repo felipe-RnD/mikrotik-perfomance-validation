@@ -1,0 +1,28 @@
+# This file is a reference for the tester, mirroring Section 3.5
+# of the Test Plan. The automation reads the profile name from
+# host_vars/dut.yml, not from this file.
+
+vm_test_matrix:
+  - profile_name: "Essential_2C_6G"
+    vcpu: 2
+    ram_gb: 6
+  
+  - profile_name: "Minimum_4C_16G"
+    vcpu: 4
+    ram_gb: 16
+  
+  - profile_name: "Standard-Small_6C_12G"
+    vcpu: 6
+    ram_gb: 12
+
+  - profile_name: "Standard-Medium_8C_16G"
+    vcpu: 8
+    ram_gb: 16
+
+  - profile_name: "Standard-Large_12C_24G"
+    vcpu: 12
+    ram_gb: 24
+
+  - profile_name: "Maximum_16C_32G"
+    vcpu: 16
+    ram_gb: 32

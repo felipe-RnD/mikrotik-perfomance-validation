@@ -1,0 +1,17 @@
+- name: Explicitly load DUT variables from file
+  ansible.builtin.include_vars:
+    file: "../../host_vars/dut.yml"
+    name: dut_vars
+
+- name: Set DUT profile fact from loaded vars
+  ansible.builtin.set_fact:
+    dut_current_profile: "{{ dut_vars['dut_current_profile'] | default('Unknown') }}"
+
+- name: Validate DUT Profile
+  ansible.builtin.fail:
+    msg: "DUT Profile could not be determined. Please check host_vars/dut.yml for 'dut_current_profile'."
+  when: dut_current_profile == 'Unknown'
+
+- name: Display Detected Profile
+  ansible.builtin.debug:
+    msg: "DUT is running with profile: {{ dut_current_profile }}"

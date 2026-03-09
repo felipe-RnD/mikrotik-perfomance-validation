@@ -15,7 +15,7 @@
 #   - "Maximum_16C_32G"
 # -----------------------------------------------------------------
 
-dut_current_profile: "Minimum_4C_8G"
+dut_current_profile: "Minimum_4C_16G"
 
 # -----------------------------------------------------------------
 # Platform Selection

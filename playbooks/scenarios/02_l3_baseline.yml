@@ -1,0 +1,577 @@
+# Scenario 2 - L3 Baseline (MikroTik RouterOS Performance Validation)
+# Tests basic L3 forwarding performance with a single path
+
+- name: Scenario 2 - L3 Baseline standalone mode
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+  vars:
+    results_dir_base: "{{ results_base_dir }}/l3_baseline_standalone"
+    large_packet_size: "{{ large_packet_size_traffic | default(1500) }}"
+    large_packet_label: "{{ large_packet_size }}b"
+    validation_duration_sec: 60
+
+  pre_tasks:
+    - name: S2 - Gather facts for timestamps
+      ansible.builtin.setup:
+        gather_subset: ['!all', 'date_time']
+
+    - name: S2 - Set unique results directory
+      ansible.builtin.set_fact:
+        test_mode_results_dir: "{{ results_dir_base }}_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: S2 PRE-TASK - Create results directory
+      ansible.builtin.file:
+        path: "{{ test_mode_results_dir }}"
+        state: directory
+        mode: '0755'
+
+    # -----------------------------------------------------------------------
+    # Variable Loading Strategy (Robust & Prioritized)
+    # -----------------------------------------------------------------------
+
+    # 1. Load T-Rex Defaults into namespace (Safe lookup)
+    - name: S2 PRE-TASK - Load T-Rex Defaults
+      ansible.builtin.include_vars:
+        file: "../../inventory/group_vars/trex_server.yml"
+        name: trex_defaults
+
+    # 2. Identify DUT and Platform
+    - name: S2 PRE-TASK - Identify DUT Hostname
+      ansible.builtin.set_fact:
+        dut_hostname: "{{ groups['versa_duts'][0] }}"
+
+    # 3. Load DUT Variables (Priority 1 - sets platform_name)
+    - name: S2 PRE-TASK - Load DUT Host Variables (Get Platform)
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    # 4. Load Platform Variables (Priority 2 - sets Hardware Limits)
+    - name: S2 PRE-TASK - Load Platform Variables
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ platform_name }}.yml"
+      ignore_errors: yes
+
+    # 5. Reload DUT Variables (Priority 1 Override - Enforce VM Limits)
+    - name: S2 PRE-TASK - Load DUT Host Variables (Enforce VM Limits)
+      ansible.builtin.include_vars:
+        file: "../../host_vars/{{ dut_hostname }}.yml"
+
+    # 6. Consolidate Variables & Enforce Precedence
+    - name: S2 PRE-TASK - Extract Infrastructure Variables
+      ansible.builtin.set_fact:
+        # Connection Facts
+        dut_ansible_host: "{{ hostvars[dut_hostname]['ansible_host'] }}"
+        dut_ansible_user: "{{ hostvars[dut_hostname]['ansible_user'] }}"
+        dut_ansible_ssh_pass: "{{ hostvars[dut_hostname]['ansible_password'] | default(hostvars[dut_hostname]['ansible_ssh_pass']) }}"
+
+        # T-Rex Info
+        trex_ip: "{{ hostvars[groups['trex_server'][0]]['trex_ip'] }}"
+        trex_install_dir: "{{ trex_defaults['trex_install_dir'] }}"
+
+        # App Server Info
+        app_server_ip: "{{ hostvars[groups['app_server'][0]]['app_server_ip'] }}"
+        app_server_base_if: "{{ hostvars[groups['app_server'][0]]['app_server_base_if'] }}"
+
+        # Binary Search Limits (Logic: DUT > Platform > T-Rex Default)
+        binary_search_max_gbps: "{{ binary_search_max_gbps | default(trex_defaults['binary_search_max_gbps']) | default(10.0) }}"
+        binary_search_max_64b_gbps: "{{ binary_search_max_64b_gbps | default(trex_defaults['binary_search_max_64b_gbps']) | default(0.3) }}"
+        binary_search_max_512b_gbps: "{{ binary_search_max_512b_gbps | default(trex_defaults['binary_search_max_512b_gbps']) | default(1.0) }}"
+        binary_search_max_large_gbps: "{{ binary_search_max_large_gbps | default(trex_defaults['binary_search_max_large_gbps']) | default(3.0) }}"
+        binary_search_max_imix_gbps: "{{ binary_search_max_imix_gbps | default(trex_defaults['binary_search_max_imix_gbps']) | default(2.0) }}"
+
+        # Binary Search Parameters
+        binary_search_min_gbps: "{{ binary_search_min_gbps | default(trex_defaults['binary_search_min_gbps']) | default(0.01) }}"
+        binary_search_resolution_gbps: "{{ binary_search_resolution_gbps | default(trex_defaults['binary_search_resolution_gbps']) | default(0.005) }}"
+        binary_search_duration_sec: "{{ binary_search_duration_sec | default(trex_defaults['binary_search_duration_sec']) | default(60) }}"
+        binary_search_loss_pct: "{{ binary_search_loss_pct | default(trex_defaults['binary_search_loss_pct']) | default(0.003) }}"
+
+    - name: S2 PRE-TASK - Display test configuration
+      ansible.builtin.debug:
+        msg:
+          - "[SCENARIO 2 - L3 BASELINE]"
+          - ""
+          - "Test Mode: standalone"
+          - "Results Directory: {{ test_mode_results_dir }}"
+          - "DUT Profile: {{ dut_current_profile | default('Unknown') }}"
+          - "Platform: {{ platform_name }}"
+          - "WAN Trunk: {{ dut_interface_map.wan_trunk }}"
+          - "Max Rate ({{ large_packet_label }}): {{ binary_search_max_large_gbps }} Gbps"
+          - "Max Rate (IMIX): {{ binary_search_max_imix_gbps }} Gbps"
+          - "Max Rate (64b): {{ binary_search_max_64b_gbps }} Gbps"
+          - "Acceptable Loss: {{ binary_search_loss_pct }} ({{ (binary_search_loss_pct|float * 100)|round(2) }}%)"
+          - "App Server IF: {{ app_server_base_if }}"
+          - "Starting XDP Reflector validation..."
+
+    # -----------------------------------------------------------------------
+    # XDP Reflector Setup
+    # -----------------------------------------------------------------------
+    - name: S2 PRE-TASK - Check if XDP reflector binary exists
+      ansible.builtin.stat:
+        path: /opt/scripts/xdp_loader
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: xdp_binary
+
+    - name: S2 PRE-TASK - Fail if XDP reflector not found
+      ansible.builtin.fail:
+        msg: "XDP reflector not found at /opt/scripts/xdp_loader. Please compile it first."
+      when: not xdp_binary.stat.exists
+
+    - name: S2 PRE-TASK - Kill any existing XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off || true"
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S2 PRE-TASK - Start XDP reflector
+      ansible.builtin.shell: |
+        nohup sudo /opt/scripts/xdp_loader -i {{ app_server_base_if }} > /tmp/xdp_reflect.log 2>&1 &
+      args:
+        chdir: /opt/scripts
+      delegate_to: "{{ groups['app_server'][0] }}"
+
+    - name: S2 PRE-TASK - Wait for XDP reflector to initialize
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: S2 PRE-TASK - Verify XDP reflector is ATTACHED
+      ansible.builtin.shell: "ip link show dev {{ app_server_base_if }}"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      register: ip_link_output
+      until: ip_link_output.stdout is defined and ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)')
+      retries: 3
+      delay: 2
+      failed_when: not (ip_link_output.stdout | regex_search('(xdp/id|prog/xdp)'))
+
+    - name: S2 PRE-TASK - Test connectivity AFTER XDP reflector loaded
+      ansible.builtin.shell: "ping -c 3 -W 2 {{ app_server_ip }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: ping_app_from_trex
+      failed_when: false
+
+    - name: S2 PRE-TASK - Display connectivity test result
+      ansible.builtin.debug:
+        msg: "Ping from T-Rex to App Server: {{ 'SUCCESS' if ping_app_from_trex.rc == 0 else 'FAILED' }}"
+
+  tasks:
+    - name: S2 - Set DUT to {{ test_mode }} mode
+      ansible.builtin.include_role:
+        name: 04_dut_control
+        tasks_from: set_test_mode.yml
+      vars:
+        mode: "{{ test_mode }}"
+        _current_run_dir: "{{ test_mode_results_dir }}"
+        ansible_host: "{{ dut_ansible_host }}"
+        ansible_user: "{{ dut_ansible_user }}"
+        ansible_ssh_pass: "{{ dut_ansible_ssh_pass }}"
+        versa_org_name: "{{ hostvars[dut_hostname]['versa_org_name'] }}"
+        versa_sdwan_policy_name: "{{ hostvars[dut_hostname]['versa_sdwan_policy_name'] }}"
+        versa_sdwan_rule_name: "{{ hostvars[dut_hostname]['versa_sdwan_rule_name'] }}"
+        versa_dia_rule_name: "{{ hostvars[dut_hostname]['versa_dia_rule_name'] }}"
+      when: test_mode != 'standalone'
+
+    - name: S2 - Enable single WAN path (VLAN 100)
+      ansible.builtin.include_role:
+        name: 04_dut_control
+        tasks_from: enable_paths.yml
+      vars:
+        paths_to_enable: 1
+        mode: "{{ test_mode }}"
+        _current_run_dir: "{{ test_mode_results_dir }}"
+        ansible_host: "{{ dut_ansible_host }}"
+        ansible_user: "{{ dut_ansible_user }}"
+        ansible_ssh_pass: "{{ dut_ansible_ssh_pass }}"
+        wan_vlans: "{{ hostvars[dut_hostname]['wan_vlans'] }}"
+      when: test_mode != 'standalone'
+
+    # ========================================================================
+    # TEST 1: 64 BYTES
+    # ========================================================================
+    - name: S2 - Run L3 Baseline Binary Search (64 bytes)
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "l3_64b"
+        binary_search_max_gbps: "{{ binary_search_max_64b_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+
+    - name: S2 - Store 64b max rate
+      ansible.builtin.set_fact:
+        max_rate_64b: "{{ gbps | default(0) }}"
+
+    - name: S2 - Brief pause before validation run
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: S2 - Start DUT monitoring for 64b validation (background)
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ validation_duration_sec }}" \
+          -e "monitor_interval_sec=30" \
+          -e "monitor_start_delay_sec=28" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s2_64b_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
+          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+      args:
+        chdir: /opt/versa-sdwan-performance-test
+      async: "{{ (validation_duration_sec | int * 3) + 60 }}"
+      poll: 0
+      register: monitor_64b
+      become: false # Ensure local monitoring runs as ubuntu
+
+    - name: S2 - Run 64b validation test at max rate
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        traffic_profile_name: "l3_64b"
+        duration: "{{ validation_duration_sec | int + 5 }}"
+        rate_gbps: "{{ max_rate_64b }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s2_64b_validation.log"
+
+    - name: S2 - Wait for 64b monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ monitor_64b.ansible_job_id }}"
+      register: monitor_64b_result
+      until: monitor_64b_result.finished
+      retries: 60
+      delay: 5
+      become: false
+
+    - name: S2 - Save 64b results
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "02_l3_baseline",
+            "test_mode": "{{ test_mode }}",
+            "packet_size": 64,
+            "max_rate_gbps": {{ max_rate_64b }},
+            "validation_duration_sec": {{ validation_duration_sec }},
+            "monitoring_log": "s2_64b_dut_monitor.log",
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s2_l3_64b.json"
+        mode: '0644'
+
+    - name: S2 - Pause between tests
+      ansible.builtin.pause:
+        seconds: 10
+
+    # ========================================================================
+    # TEST 2: 512 BYTES
+    # ========================================================================
+    - name: S2 - Run L3 Baseline Binary Search (512 bytes)
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "l3_512b"
+        binary_search_max_gbps: "{{ binary_search_max_512b_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+
+    - name: S2 - Store 512b max rate
+      ansible.builtin.set_fact:
+        max_rate_512b: "{{ gbps | default(0) }}"
+
+    - name: S2 - Start DUT monitoring for 512b validation (background)
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ validation_duration_sec }}" \
+          -e "monitor_interval_sec=30" \
+          -e "monitor_start_delay_sec=28" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s2_512b_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
+          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+      args:
+        chdir: /opt/versa-sdwan-performance-test
+      async: "{{ (validation_duration_sec | int * 3) + 60 }}"
+      poll: 0
+      register: monitor_512b
+      become: false
+
+    - name: S2 - Run 512b validation test at max rate
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        traffic_profile_name: "l3_512b"
+        duration: "{{ validation_duration_sec | int + 5 }}"
+        rate_gbps: "{{ max_rate_512b }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s2_512b_validation.log"
+
+    - name: S2 - Wait for 512b monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ monitor_512b.ansible_job_id }}"
+      register: monitor_512b_result
+      until: monitor_512b_result.finished
+      retries: 60
+      delay: 5
+      become: false
+
+    - name: S2 - Save 512b results
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "02_l3_baseline",
+            "test_mode": "{{ test_mode }}",
+            "packet_size": 512,
+            "max_rate_gbps": {{ max_rate_512b }},
+            "validation_duration_sec": {{ validation_duration_sec }},
+            "monitoring_log": "s2_512b_dut_monitor.log",
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s2_l3_512b.json"
+        mode: '0644'
+
+    - name: S2 - Pause between tests
+      ansible.builtin.pause:
+        seconds: 10
+
+    # ========================================================================
+    # TEST 3: LARGE PACKETS ({{ large_packet_size }} bytes)
+    # ========================================================================
+    - name: S2 - Run L3 Baseline Binary Search ({{ large_packet_size }} bytes)
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "l3_{{ large_packet_label }}"
+        binary_search_max_gbps: "{{ binary_search_max_large_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+
+    - name: S2 - Store large packet max rate
+      ansible.builtin.set_fact:
+        max_rate_large: "{{ gbps | default(0) }}"
+
+    - name: S2 - Start DUT monitoring for large packet validation (background)
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ validation_duration_sec }}" \
+          -e "monitor_interval_sec=30" \
+          -e "monitor_start_delay_sec=28" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s2_large_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
+          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+      args:
+        chdir: /opt/versa-sdwan-performance-test
+      async: "{{ (validation_duration_sec | int * 3) + 60 }}"
+      poll: 0
+      register: monitor_large
+      become: false
+
+    - name: S2 - Run large packet validation test at max rate
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        traffic_profile_name: "l3_{{ large_packet_label }}"
+        duration: "{{ validation_duration_sec | int + 5 }}"
+        rate_gbps: "{{ max_rate_large }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s2_large_validation.log"
+
+    - name: S2 - Wait for large packet monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ monitor_large.ansible_job_id }}"
+      register: monitor_large_result
+      until: monitor_large_result.finished
+      retries: 60
+      delay: 5
+      become: false
+
+    - name: S2 - Save large packet results
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "02_l3_baseline",
+            "test_mode": "{{ test_mode }}",
+            "packet_size": {{ large_packet_size }},
+            "packet_size_label": "large",
+            "max_rate_gbps": {{ max_rate_large }},
+            "validation_duration_sec": {{ validation_duration_sec }},
+            "monitoring_log": "s2_large_dut_monitor.log",
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s2_l3_large.json"
+        mode: '0644'
+
+    - name: S2 - Pause between tests
+      ansible.builtin.pause:
+        seconds: 10
+
+    # ========================================================================
+    # TEST 4: IMIX
+    # ========================================================================
+    - name: S2 - Run L3 Baseline Binary Search (IMIX)
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: binary_search.yml
+      vars:
+        traffic_profile_name: "imix"
+        binary_search_max_gbps: "{{ binary_search_max_imix_gbps }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+
+    - name: S2 - Store IMIX max rate
+      ansible.builtin.set_fact:
+        max_rate_imix: "{{ gbps | default(0) }}"
+
+    - name: S2 - Start DUT monitoring for IMIX validation (background)
+      ansible.builtin.shell: |
+        ansible-playbook -i {{ playbook_dir }}/../../inventory/hosts.yml \
+        {{ playbook_dir }}/../utils/run_monitoring.yml \
+          -e "monitor_duration_sec={{ validation_duration_sec }}" \
+          -e "monitor_interval_sec=30" \
+          -e "monitor_start_delay_sec=28" \
+          -e "monitor_output_file={{ test_mode_results_dir }}/s2_imix_dut_monitor.log" \
+          -e "ansible_host={{ dut_ansible_host }}" \
+          -e "ansible_user={{ dut_ansible_user }}" \
+          -e "ansible_ssh_pass={{ dut_ansible_ssh_pass }}" \
+          -e "versa_org_name={{ hostvars[dut_hostname]['versa_org_name'] }}" \
+          -e "versa_hub_name={{ hostvars[dut_hostname]['versa_hub_name'] }}" \
+          -e "dut_wan_trunk={{ dut_interface_map.wan_trunk }}" \
+          -e "dut_lan_trex={{ dut_interface_map.lan_trex }}"
+      args:
+        chdir: /opt/versa-sdwan-performance-test
+      async: "{{ (validation_duration_sec | int * 3) + 60 }}"
+      poll: 0
+      register: monitor_imix
+      become: false
+
+    - name: S2 - Run IMIX validation test at max rate
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml
+      vars:
+        traffic_profile_name: "imix"
+        duration: "{{ validation_duration_sec | int + 5 }}"
+        rate_gbps: "{{ max_rate_imix }}"
+        profile_client_ip: "{{ trex_ip }}"
+        profile_server_ip: "{{ app_server_ip }}"
+        profile_gateway_ip: "{{ dut_trex_lan_ip }}"
+        results_file_name: "{{ test_mode_results_dir }}/s2_imix_validation.log"
+
+    - name: S2 - Wait for IMIX monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ monitor_imix.ansible_job_id }}"
+      register: monitor_imix_result
+      until: monitor_imix_result.finished
+      retries: 60
+      delay: 5
+      become: false
+
+    - name: S2 - Save IMIX results
+      ansible.builtin.copy:
+        content: |
+          {
+            "scenario": "02_l3_baseline",
+            "test_mode": "{{ test_mode }}",
+            "packet_size": "IMIX",
+            "max_rate_gbps": {{ max_rate_imix }},
+            "validation_duration_sec": {{ validation_duration_sec }},
+            "monitoring_log": "s2_imix_dut_monitor.log",
+            "timestamp": "{{ ansible_date_time.iso8601 }}"
+          }
+        dest: "{{ test_mode_results_dir }}/s2_l3_imix.json"
+        mode: '0644'
+    # ========================================================================
+    # POST-PROCESSING: Parse and Enrich Results
+    # ========================================================================
+
+    - name: S2 - Parse and enrich results
+      ansible.builtin.command:
+        # [FIX] Added ../../ to correctly reach scripts directory
+        cmd: >
+          python3 {{ playbook_dir }}/../../scripts/analysis/parse_s02_results.py
+          {{ test_mode_results_dir }}
+          --loss-threshold {{ (binary_search_loss_pct | float * 100) | round(2) }}
+        chdir: "{{ playbook_dir }}/.."
+      register: parse_result
+      delegate_to: localhost
+      become: false
+
+    - name: S2 - Display parsing summary
+      ansible.builtin.debug:
+        msg: "{{ parse_result.stdout_lines }}"
+
+    - name: S2 - Load enriched summary
+      ansible.builtin.slurp:
+        src: "{{ test_mode_results_dir }}/s02_summary.json"
+      register: s02_summary_raw
+      delegate_to: localhost
+      become: false
+
+    - name: S2 - Parse summary JSON
+      ansible.builtin.set_fact:
+        s02_summary: "{{ s02_summary_raw.content | b64decode | from_json }}"
+
+    - name: S2 - Display final test results
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "=================================================================================================================================="
+          - "  L3 BASELINE TEST COMPLETE - STANDALONE MODE"
+          - "=================================================================================================================================="
+          - ""
+          - "DUT Profile: {{ dut_current_profile | default('Unknown') }}"
+          - "Platform: {{ platform_name }}"
+          - "Loss Threshold: {{ (binary_search_loss_pct | float * 100) | round(2) }}%"
+          - ""
+          - "Performance Results:"
+          - "  64-byte:   {{ s02_summary.packet_size_results['64b'].binary_search.max_rate_gbps }} Gbps ({{ s02_summary.packet_size_results['64b'].validation.packet_loss_pct }}% loss) - {{ 'PASS' if s02_summary.packet_size_results['64b'].pass else 'FAIL' }}"
+          - "  512-byte:  {{ s02_summary.packet_size_results['512b'].binary_search.max_rate_gbps }} Gbps ({{ s02_summary.packet_size_results['512b'].validation.packet_loss_pct }}% loss) - {{ 'PASS' if s02_summary.packet_size_results['512b'].pass else 'FAIL' }}"
+          - "  {{ large_packet_size }}-byte: {{ s02_summary.packet_size_results['large'].binary_search.max_rate_gbps }} Gbps ({{ s02_summary.packet_size_results['large'].validation.packet_loss_pct }}% loss) - {{ 'PASS' if s02_summary.packet_size_results['large'].pass else 'FAIL' }}"
+          - "  IMIX:      {{ s02_summary.packet_size_results['imix'].binary_search.max_rate_gbps }} Gbps ({{ s02_summary.packet_size_results['imix'].validation.packet_loss_pct }}% loss) - {{ 'PASS' if s02_summary.packet_size_results['imix'].pass else 'FAIL' }}"
+          - ""
+          - "Tests Passed: {{ s02_summary.summary.passed }}/{{ s02_summary.summary.total_tests }}"
+          - ""
+          - "Results saved to: {{ test_mode_results_dir }}/"
+
+  post_tasks:
+    - name: S2 POST-TASK - Detach XDP reflector
+      ansible.builtin.shell: "sudo ip link set dev {{ app_server_base_if }} xdp off"
+      delegate_to: "{{ groups['app_server'][0] }}"
+      changed_when: false
+      failed_when: false
+
+    - name: S2 POST-TASK - Verify connectivity after shutdown
+      ansible.builtin.shell: "ping -c 3 {{ app_server_ip }}"
+      delegate_to: "{{ groups['trex_server'][0] }}"
+      register: final_ping
+      failed_when: false
+    - name: S2 POST-TASK - Display final connectivity status
+      ansible.builtin.debug:
+        msg: "Connectivity after XDP reflector shutdown: {{ 'OK' if final_ping.rc == 0 else 'CHECK MANUALLY' }}"

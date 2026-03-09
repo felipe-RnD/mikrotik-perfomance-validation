@@ -73,4 +73,4 @@ app_server_base_url: "http://{{ app_server_ip }}"
 # -----------------------------------------------------------------
 
 # large_packet_size_sdwan: 1360    # Safe for IPsec tunnel encapsulation
-large_packet_size: 1472      # Max UDP payload without fragmentation
+large_packet_size_traffic: 1472      # Max UDP payload without fragmentation

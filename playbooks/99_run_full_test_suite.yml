@@ -1,0 +1,64 @@
+- name: 99 - Run Full Test Suite (Isolated Suite Run)
+  hosts: localhost
+  gather_facts: yes
+  tags: current_permutation
+  vars_files:
+    - ../inventory/group_vars/all.yml
+
+  tasks:
+    # -----------------------------------------------------------------
+    # Step 0: Suite Initialization & Isolation
+    # -----------------------------------------------------------------
+    - name: 99 - Get Date/Time for Suite Run ID
+      ansible.builtin.setup:
+        gather_subset:
+          - '!all'
+          - 'date_time'
+
+    - name: 99 - Define Isolated Suite Directory
+      ansible.builtin.set_fact:
+        results_base_dir: "{{ playbook_dir }}/../results/Suite_Run_{{ ansible_date_time.iso8601_basic_short }}"
+        cacheable: yes
+
+    - name: 99 - Create Suite Directory
+      ansible.builtin.file:
+        path: "{{ results_base_dir }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+    - name: 99 - Display Suite Isolation Info
+      ansible.builtin.debug:
+        msg: "Results for this full run will be isolated in: {{ results_base_dir }}"
+
+    # -----------------------------------------------------------------
+    # Step 1: Auto-Discover DUT VM Profile
+    # -----------------------------------------------------------------
+    - name: 99 - Auto-Discover DUT VM Profile
+      ansible.builtin.include_role:
+        name: 05_dut_provision
+        tasks_from: get_vm_profile.yml
+
+    - name: 99 - Fail if profile detection failed
+      ansible.builtin.fail:
+        msg: "Could not detect a valid VM profile. Please check DUT connectivity."
+      when: dut_current_profile is not defined or dut_current_profile == 'Unknown'
+
+    # -----------------------------------------------------------------
+    # Step 2: Prepare Profile-Specific Results Directory
+    # -----------------------------------------------------------------
+    - name: 99 - Create Profile Report Directory
+      ansible.builtin.file:
+        path: "{{ results_base_dir }}/{{ dut_current_profile }}"
+        state: directory
+        mode: '0755'
+      become: false
+
+# -----------------------------------------------------------------
+# Step 2: Execute Standalone Scenarios
+# -----------------------------------------------------------------
+# We run these once globally rather than inside loops.
+- import_playbook: scenarios/02_l3_baseline.yml
+- import_playbook: scenarios/03_scaling_and_quality.yml
+- import_playbook: scenarios/04_session_scalability.yml
+- import_playbook: scenarios/05_extended_stability.yml

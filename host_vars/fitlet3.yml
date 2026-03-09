@@ -9,7 +9,7 @@
 # Platform Identification
 platform_type: "Fitlet3"
 platform_cpu: "Intel Atom x7-E3950 (4 Cores)"
-platform_ram: "8 GB"
+platform_ram: "16 GB"
 platform_interface_speed_gb: 1  # 1GbE interfaces
 
 # -----------------------------------------------------------------
