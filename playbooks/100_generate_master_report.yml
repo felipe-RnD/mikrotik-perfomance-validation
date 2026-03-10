@@ -1,0 +1,270 @@
+# =============================================================================
+# 100_generate_master_report.yml - Master Report Generator
+# =============================================================================
+#
+# Generates a consolidated HTML/PDF report from SD-WAN performance test results.
+#
+# Platform and Profile:
+#   - platform_name: Loaded automatically from host_vars/dut.yml
+#   - dut_current_profile: Loaded automatically from host_vars/dut.yml
+#   - Both can be overridden via -e if needed
+#
+# Directory Structure Expected:
+#   Suite_Run_YYYYMMDDTHHMMSS/
+#   +-- <Profile_Name>/                              # Profile folder (may be empty)
+#   +-- l3_baseline_sdwan_YYYYMMDDTHHMMSS/           # S02 SD-WAN
+#   +-- l3_baseline_dia_YYYYMMDDTHHMMSS/             # S02 DIA
+#   +-- scaling_quality_sdwan_YYYYMMDDTHHMMSS/       # S03 SD-WAN
+#   +-- scaling_quality_dia_YYYYMMDDTHHMMSS/         # S03 DIA
+#   +-- session_scalability_sdwan_YYYYMMDDTHHMMSS/   # S04 SD-WAN
+#   +-- session_scalability_dia_YYYYMMDDTHHMMSS/     # S04 DIA
+#   +-- extended_stability_sdwan_YYYYMMDDTHHMMSS/    # S05 SD-WAN
+#   +-- extended_stability_dia_YYYYMMDDTHHMMSS/      # S05 DIA
+#
+# Usage Modes:
+#
+# 1. AUTOMATIC (at end of 99_run_full_test_suite.yml):
+#    Automatically uses results_base_dir from playbook 99
+#    Platform loaded from host_vars/dut.yml
+#    ansible-playbook playbooks/100_generate_master_report.yml
+#
+# 2. STANDALONE - Latest Suite:
+#    Finds and uses the most recent Suite_Run_* directory
+#    ansible-playbook playbooks/100_generate_master_report.yml -e "use_latest=true"
+#
+# 3. STANDALONE - Specific Directory:
+#    Uses a manually specified directory
+#    ansible-playbook playbooks/100_generate_master_report.yml \
+#        -e "target_suite_dir=/path/to/Suite_Run_20251126T094840"
+#
+# Optional Variables:
+#   generate_pdf: true/false - Also generate PDF version (requires weasyprint/wkhtmltopdf)
+#   generate_json: true/false - Also generate consolidated JSON
+#   platform_name_override: Override platform from dut.yml (e.g., "Lanner NCA-1515")
+#   profile_name_override: Override profile detection
+#
+# Dynamically pulls Pass/Fail thresholds from inventory/group_vars/
+#   - Sources of Truth:
+#       * Loss Threshold: trex_server.yml (binary_search_loss_pct)
+#       * K6 Latency/VUs: k6_server.yml
+#
+# =============================================================================
+
+- name: 100 - Generate Master Report
+  hosts: localhost
+  gather_facts: yes
+  vars_files:
+    - ../inventory/group_vars/all.yml
+    - ../host_vars/dut.yml
+
+  vars:
+    # Execution Flags
+    generate_pdf: false
+    generate_json: true
+    use_latest: false
+    scripts_dir: "{{ playbook_dir }}/../scripts/analysis"
+    
+    # Platform Overrides
+    profile_name_override: ""
+    platform_name_override: ""
+    
+    # Defaults (Used only if inventory vars are missing)
+    default_latency_threshold: 200
+    default_min_success: 95.0
+    default_stability_loss: 0.5
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Step 0: Load "Source of Truth" Variables from Inventory
+    # -------------------------------------------------------------------------
+    - name: 100 - Load T-Rex Variables (Source of Loss Threshold)
+      ansible.builtin.include_vars:
+        file: ../inventory/group_vars/trex_server.yml
+        name: trex_vars
+
+    - name: 100 - Load K6 Variables (Source of Latency/VUs)
+      ansible.builtin.include_vars:
+        file: ../inventory/group_vars/k6_server.yml
+        name: k6_vars
+
+    - name: 100 - Calculate Dynamic Thresholds
+      ansible.builtin.set_fact:
+        # S02: Use the explicit validation threshold from inventory
+        # Fallback: Derive from binary search ratio if explicit var is missing
+        calc_s02_loss_threshold: "{{ trex_vars.validation_loss_pct | default((trex_vars.binary_search_loss_pct | default(0.00336) | float * 100) | round(3)) }}"
+        
+        # S03: Scaling threshold is typically same as S02 or slightly looser
+        calc_s03_loss_threshold: 0.5
+        
+        # K6 Latency: Source from k6_server.yml
+        calc_s03_latency_threshold: "{{ k6_vars.k6_latency_threshold_ms | default(200) }}"
+        
+        calc_s04_min_success: 95.0
+        calc_s05_max_loss: 0.5    
+    # -------------------------------------------------------------------------
+    # Step 1: Determine Target Suite Directory
+    # -------------------------------------------------------------------------
+    
+    - name: 100 - Check if results_base_dir is set (from playbook 99)
+      ansible.builtin.set_fact:
+        suite_dir_from_99: "{{ hostvars['localhost']['results_base_dir'] | default('') }}"
+
+    - name: 100 - Use results_base_dir from playbook 99 if available
+      ansible.builtin.set_fact:
+        target_suite_dir: "{{ suite_dir_from_99 }}"
+      when:
+        - target_suite_dir is not defined
+        - suite_dir_from_99 | length > 0
+
+    - name: 100 - Find latest Suite_Run directory
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../results"
+        patterns: "Suite_Run_*"
+        file_type: directory
+      register: found_suites
+      when: target_suite_dir is not defined
+
+    - name: 100 - Select latest suite directory
+      ansible.builtin.set_fact:
+        target_suite_dir: "{{ (found_suites.files | sort(attribute='mtime') | last).path }}"
+      when:
+        - target_suite_dir is not defined
+        - found_suites.matched | default(0) > 0
+
+    - name: 100 - Fail if no suite directory found
+      ansible.builtin.fail:
+        msg: "No Suite_Run directory found. Run playbook 99 first or use -e use_latest=true"
+      when: target_suite_dir is not defined
+
+    - name: 100 - Display Configuration
+      ansible.builtin.debug:
+        msg: |
+          --------------------------------------------------------------------
+          GENERATING MASTER REPORT
+          --------------------------------------------------------------------
+          Suite:    {{ target_suite_dir }}
+          Platform: {{ platform_name | default('Not specified') }}
+          
+          DYNAMIC THRESHOLDS (Loaded from Inventory):
+            S02 Loss Limit:     {{ calc_s02_loss_threshold }}% (Derived from {{ trex_vars.binary_search_loss_pct }})
+            S03 Latency Limit:  {{ calc_s03_latency_threshold }}ms
+            S04 Success Limit:  {{ calc_s04_min_success }}%
+          --------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # Step 2: Discover Scenario Directories
+    # -------------------------------------------------------------------------
+
+    - name: 100 - Find all directories in suite
+      ansible.builtin.find:
+        paths: "{{ target_suite_dir }}"
+        file_type: directory
+        recurse: no
+      register: all_dirs
+
+    - name: 100 - Identify scenario directories
+      ansible.builtin.set_fact:
+        scenario_dirs:
+          s02_sdwan: "{{ all_dirs.files | map(attribute='path') | select('search', 'l3_baseline_sdwan_') | list | first | default('') }}"
+          s02_dia: "{{ all_dirs.files | map(attribute='path') | select('search', 'l3_baseline_dia_') | list | first | default('') }}"
+          s03_sdwan: "{{ all_dirs.files | map(attribute='path') | select('search', 'scaling_quality_sdwan_') | list | first | default('') }}"
+          s03_dia: "{{ all_dirs.files | map(attribute='path') | select('search', 'scaling_quality_dia_') | list | first | default('') }}"
+          s04_sdwan: "{{ all_dirs.files | map(attribute='path') | select('search', 'session_scalability_sdwan_') | list | first | default('') }}"
+          s04_dia: "{{ all_dirs.files | map(attribute='path') | select('search', 'session_scalability_dia_') | list | first | default('') }}"
+          s05_sdwan: "{{ all_dirs.files | map(attribute='path') | select('search', 'extended_stability_sdwan_') | list | first | default('') }}"
+          s05_dia: "{{ all_dirs.files | map(attribute='path') | select('search', 'extended_stability_dia_') | list | first | default('') }}"
+
+    - name: 100 - Identify profile directory
+      ansible.builtin.set_fact:
+        profile_name: >-
+          {{ all_dirs.files 
+             | map(attribute='path') 
+             | map('basename')
+             | reject('search', '^(l3_baseline|scaling_quality|session_scalability|extended_stability|logs|tmp|__pycache__|\.)')
+             | list 
+             | first 
+             | default('Unknown_Profile') }}
+
+    # -------------------------------------------------------------------------
+    # Step 3: Run Enrichment Parsers
+    # -------------------------------------------------------------------------
+
+    - name: 100 - Enrich scenario results
+      ansible.builtin.include_tasks: 100_enrich_scenario.yml
+      loop:
+        - scenario: 's02'
+          parser: 'parse_s02_results.py'
+          dir: "{{ scenario_dirs.s02_sdwan }}"
+          args: "--loss-threshold {{ calc_s02_loss_threshold }}"
+        - scenario: 's02'
+          parser: 'parse_s02_results.py'
+          dir: "{{ scenario_dirs.s02_dia }}"
+          args: "--loss-threshold {{ calc_s02_loss_threshold }}"
+        - scenario: 's03'
+          parser: 'parse_s03_results.py'
+          dir: "{{ scenario_dirs.s03_sdwan }}"
+          args: "--loss-threshold {{ calc_s03_loss_threshold }} --latency-threshold {{ calc_s03_latency_threshold }}"
+        - scenario: 's03'
+          parser: 'parse_s03_results.py'
+          dir: "{{ scenario_dirs.s03_dia }}"
+          args: "--loss-threshold {{ calc_s03_loss_threshold }} --latency-threshold {{ calc_s03_latency_threshold }}"
+        - scenario: 's04'
+          parser: 'parse_s04_results.py'
+          dir: "{{ scenario_dirs.s04_sdwan }}"
+          args: "--min-success-rate {{ calc_s04_min_success }}"
+        - scenario: 's04'
+          parser: 'parse_s04_results.py'
+          dir: "{{ scenario_dirs.s04_dia }}"
+          args: "--min-success-rate {{ calc_s04_min_success }}"
+        - scenario: 's05'
+          parser: 'parse_s05_results.py'
+          dir: "{{ scenario_dirs.s05_sdwan }}"
+          args: "--max-loss {{ calc_s05_max_loss }}"
+        - scenario: 's05'
+          parser: 'parse_s05_results.py'
+          dir: "{{ scenario_dirs.s05_dia }}"
+          args: "--max-loss {{ calc_s05_max_loss }}"
+      loop_control:
+        loop_var: enrich_item
+      when: enrich_item.dir | length > 0
+
+    # -------------------------------------------------------------------------
+    # Step 4: Generate Master Report
+    # -------------------------------------------------------------------------
+
+    - name: 100 - Determine effective names
+      ansible.builtin.set_fact:
+        effective_platform: "{{ platform_name_override if platform_name_override | length > 0 else platform_name | default('') }}"
+        effective_profile: "{{ profile_name_override if profile_name_override | length > 0 else '' }}"
+
+    - name: 100 - Build Python Command
+      ansible.builtin.set_fact:
+        report_cmd: >-
+          python3 {{ scripts_dir }}/generate_master_report.py
+          {{ target_suite_dir }}
+          --output {{ target_suite_dir }}/master_report.html
+          --s02-loss-threshold {{ calc_s02_loss_threshold }}
+          --s03-loss-threshold {{ calc_s03_loss_threshold }}
+          --s03-latency-threshold {{ calc_s03_latency_threshold }}
+          --s04-min-success-rate {{ calc_s04_min_success }}
+          --s05-max-loss {{ calc_s05_max_loss }}
+          {% if generate_pdf %} --pdf {% endif %}
+          {% if generate_json %} --json-output {{ target_suite_dir }}/master_report.json {% endif %}
+          {% if effective_platform %} --platform "{{ effective_platform }}" {% endif %}
+          {% if effective_profile %} --profile "{{ effective_profile }}" {% endif %}
+
+    - name: 100 - Execute Report Generator
+      ansible.builtin.command:
+        cmd: "{{ report_cmd }}"
+        chdir: "{{ playbook_dir }}/.."
+      register: report_result
+      delegate_to: localhost
+      become: false
+
+    - name: 100 - Display Output
+      ansible.builtin.debug:
+        msg: "{{ report_result.stdout_lines }}"
+
+    - name: 100 - Final Summary
+      ansible.builtin.debug:
+        msg: "Report available at: file://{{ target_suite_dir }}/master_report.html"

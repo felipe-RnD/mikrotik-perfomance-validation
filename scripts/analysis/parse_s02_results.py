@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scenario 02 (L3 Baseline) Results Parser
+Scenario 02 (L3 Baseline) Results Parser - MikroTik RouterOS
 
 Parses T-Rex validation logs and DUT monitor logs to enrich the basic JSON
 results with detailed performance metrics.
@@ -9,13 +9,19 @@ Usage:
     python parse_s02_results.py <results_directory>
 
 Example:
-    python parse_s02_results.py /opt/versa-sdwan-performance-test/results/l3_baseline_sdwan_20251126T094842
+    python parse_s02_results.py /home/scadmin/mikrotik-perfomance-validation/results/Suite_Run_20260310T143414/l3_baseline_mikrotik_20260310T143415
 
 The script will:
 1. Find all s2_l3_*.json files in the directory
 2. Parse corresponding validation and monitor logs
 3. Update JSON files with enriched data
 4. Generate a consolidated s02_summary.json
+
+DUT monitor log format (MikroTik RouterOS 7.x):
+  - /system resource print   -> cpu-load, free-memory, total-memory
+  - /interface print stats   -> RX-BYTE, TX-BYTE, RX-PACKET, TX-PACKET per interface
+  - /ip firewall connection print count-only -> active connection count
+  - /system health print     -> hardware health (may be disabled on CHR)
 """
 
 import os
@@ -186,157 +192,137 @@ def _convert_to_pps(value: float, unit: str) -> float:
     return value * multipliers.get(unit, 1)
 
 
+def _parse_routeros_number(s: str) -> int:
+    """Parse a RouterOS space-formatted number (e.g. '697 444 142 521') to int."""
+    return int(s.replace(' ', ''))
+
+
+def _parse_mib(value: str, unit: str) -> float:
+    """Convert RouterOS memory value to MiB."""
+    v = float(value)
+    return v * 1024 if unit == 'GiB' else v
+
+
 def parse_dut_monitor_log(filepath: Path) -> Optional[DutStats]:
     """
-    Parse DUT monitor log to extract system and interface statistics.
-    
-    Handles multiple iterations and averages the values.
+    Parse MikroTik RouterOS DUT monitor log to extract system and interface statistics.
+
+    Expects the log format produced by the persistent_monitor_dut.exp expect script:
+      - Iterations delimited by 80x'=' + 'Iteration X/Y - timestamp' headers
+      - /system resource print output  (cpu-load, free-memory, total-memory)
+      - /interface print stats output  (NAME, RX-BYTE, TX-BYTE, RX-PACKET, TX-PACKET)
+      - /ip firewall connection print count-only output (plain integer)
+
+    Interface column layout (RouterOS 7.x):
+      #  R  NAME    RX-BYTE   TX-BYTE   RX-PACKET  TX-PACKET
+    Numbers use space grouping (e.g. '697 444 142 521').
     """
     if not filepath.exists():
         print(f"  Warning: DUT monitor log not found: {filepath}")
         return None
-    
+
     try:
-        content = filepath.read_text()
+        content = strip_ansi(filepath.read_text())
     except Exception as e:
         print(f"  Error reading {filepath}: {e}")
         return None
-    
-    # Split into iterations
+
+    # Split on the iteration header line produced by the expect script
+    # Header: ================================================================================\nIteration X/Y - "timestamp"
     iterations = re.split(r'={80}\nIteration \d+/\d+', content)
-    iterations = [it for it in iterations if it.strip() and 'show system load-stats' in it]
-    
+    # Keep only chunks that contain MikroTik resource output
+    iterations = [it for it in iterations if it.strip() and 'cpu-load:' in it]
+
     if not iterations:
         print(f"  Warning: No valid iterations found in {filepath}")
         return None
-    
-    # Collect metrics across iterations
+
     cpu_loads = []
-    mem_loads = []
-    poller_cpus = []
-    ctrl_cpus = []
-    load_factors = []
-    
-    # Interface stats per iteration (keyed by interface name)
+    mem_used_pcts = []
+    connections = []
     interface_samples: Dict[str, List[Dict]] = {}
-    
-    # Session stats (take from last iteration)
-    session_stats = None
-    failed_sessions = 0
-    
+
     for iteration in iterations:
-        # Parse system load stats
-        # Format: VSN ID, CPU LOAD, POLLER CPU, CTRL CPU, MEM LOAD, LOAD FACTOR
-        load_match = re.search(
-            r'0\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',
-            iteration
-        )
-        if load_match:
-            cpu_loads.append(int(load_match.group(1)))
-            poller_cpus.append(int(load_match.group(2)))
-            ctrl_cpus.append(int(load_match.group(3)))
-            mem_loads.append(int(load_match.group(4)))
-            load_factors.append(int(load_match.group(5)))
-        
-        # Parse interface statistics table
-        # Find the interface stats block
-        if_block_match = re.search(
-            r'NAME\s+INF\s+STATUS.*?(?=\[ok\]|\Z)',
-            iteration,
-            re.DOTALL
-        )
-        if if_block_match:
-            if_block = if_block_match.group(0)
-            # Parse each interface line
-            # Format: NAME HOST INF OPER STATUS RX_PACKETS RX_PPS RX_BYTES RX_ERRORS RX_BPS TX_PACKETS TX_PPS TX_BYTES TX_ERRORS TX_BPS RX_USAGE TX_USAGE
-            if_pattern = re.compile(
-                r'(vni-\d+/\d+)\s+\w+\s+(up|down)\s+'
-                r'(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+'  # RX: packets, pps, bytes, errors, bps
-                r'(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',    # TX: packets, pps, bytes, errors, bps
-                re.MULTILINE
-            )
-            for match in if_pattern.finditer(if_block):
-                iface_name = match.group(1)
-                if iface_name not in interface_samples:
-                    interface_samples[iface_name] = []
-                
-                interface_samples[iface_name].append({
-                    'status': match.group(2),
-                    'rx_packets': int(match.group(3)),
-                    'rx_pps': int(match.group(4)),
-                    'rx_bytes': int(match.group(5)),
-                    'rx_bps': int(match.group(7)),
-                    'tx_packets': int(match.group(8)),
-                    'tx_pps': int(match.group(9)),
-                    'tx_bytes': int(match.group(10)),
-                    'tx_bps': int(match.group(12)),
-                })
-        
-        # Parse session summary
-        session_match = re.search(
-            r'session-count\s+(\d+).*?'
-            r'session-created\s+(\d+).*?'
-            r'session-closed\s+(\d+).*?'
-            r'session-count-max\s+(\d+).*?'
-            r'tcp-session-count\s+(\d+).*?'
-            r'udp-session-count\s+(\d+).*?'
-            r'icmp-session-count\s+(\d+)',
-            iteration,
-            re.DOTALL
-        )
-        if session_match:
-            session_stats = SessionStats(
-                active=int(session_match.group(1)),
-                created=int(session_match.group(2)),
-                closed=int(session_match.group(3)),
-                max_allowed=int(session_match.group(4)),
-                tcp_count=int(session_match.group(5)),
-                udp_count=int(session_match.group(6)),
-                icmp_count=int(session_match.group(7)),
-            )
-        
-        # Parse failed sessions from device clients
-        failed_match = re.search(r'16\s+0\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)', iteration)
-        if failed_match:
-            failed_sessions = int(failed_match.group(1))
-    
-    if session_stats:
-        session_stats.failed = failed_sessions
-    
-    # Build DUT stats with averages
+        # --- CPU load ---
+        # Format: "                 cpu-load: 14%"
+        cpu_match = re.search(r'cpu-load:\s+(\d+)%', iteration)
+        if cpu_match:
+            cpu_loads.append(int(cpu_match.group(1)))
+
+        # --- Memory utilization ---
+        # Format: "          free-memory: 3776.5MiB"
+        #         "         total-memory: 4096.0MiB"
+        free_match = re.search(r'free-memory:\s+([\d.]+)(MiB|GiB)', iteration)
+        total_match = re.search(r'total-memory:\s+([\d.]+)(MiB|GiB)', iteration)
+        if free_match and total_match:
+            free_mib = _parse_mib(free_match.group(1), free_match.group(2))
+            total_mib = _parse_mib(total_match.group(1), total_match.group(2))
+            if total_mib > 0:
+                mem_used_pcts.append(round((total_mib - free_mib) / total_mib * 100, 1))
+
+        # --- Active firewall connections ---
+        # Output is a single integer on the line after the command echo
+        conn_match = re.search(r'connection print count-only[^\n]*\n(\d+)', iteration)
+        if conn_match:
+            connections.append(int(conn_match.group(1)))
+
+        # --- Interface statistics ---
+        # RouterOS /interface print stats columns: NAME, RX-BYTE, TX-BYTE, RX-PACKET, TX-PACKET
+        # Numbers are space-grouped (e.g. "697 444 142 521")
+        # Line format: " 0 R ether1   697 444 142 521  698 015 037 368  1 775 646 148  1 782 669 728"
+        for line in iteration.splitlines():
+            m = re.match(r'^\s*\d+\s+R?\s*([\w.]+)\s+(.*)', line)
+            if not m:
+                continue
+            iface_name = m.group(1)
+            # Skip header/flag lines
+            if iface_name in ('NAME', 'Flags:', 'Columns:'):
+                continue
+            # Split numeric columns by 2+ spaces (separates space-grouped numbers)
+            cols = re.split(r'\s{2,}', m.group(2).strip())
+            if len(cols) < 4:
+                continue
+            try:
+                sample = {
+                    'rx_bytes':   _parse_routeros_number(cols[0]),
+                    'tx_bytes':   _parse_routeros_number(cols[1]),
+                    'rx_packets': _parse_routeros_number(cols[2]),
+                    'tx_packets': _parse_routeros_number(cols[3]),
+                }
+                interface_samples.setdefault(iface_name, []).append(sample)
+            except (ValueError, IndexError):
+                continue
+
+    # --- Build DUT stats ---
     dut_stats = DutStats(
         samples=len(iterations),
-        cpu_load_avg=round(mean(cpu_loads), 1) if cpu_loads else 0,
+        cpu_load_avg=round(mean(cpu_loads), 1) if cpu_loads else 0.0,
         cpu_load_max=max(cpu_loads) if cpu_loads else 0,
         cpu_load_min=min(cpu_loads) if cpu_loads else 0,
-        mem_load_avg=round(mean(mem_loads), 1) if mem_loads else 0,
-        poller_cpu_avg=round(mean(poller_cpus), 1) if poller_cpus else 0,
-        ctrl_cpu_avg=round(mean(ctrl_cpus), 1) if ctrl_cpus else 0,
-        load_factor_avg=round(mean(load_factors), 1) if load_factors else 0,
-        sessions=session_stats,
+        mem_load_avg=round(mean(mem_used_pcts), 1) if mem_used_pcts else 0.0,
     )
-    
-    # Calculate interface averages
-    # vni-0/3 is typically LAN (T-Rex facing), vni-0/4 is typically WAN
+
+    # Connection count → reuse SessionStats.active field
+    if connections:
+        dut_stats.sessions = SessionStats(active=connections[-1])
+
+    # --- Interface averages ---
+    # vlan200 = LAN (T-Rex facing), ether1 = WAN trunk
     for iface_name, samples in interface_samples.items():
-        if not samples or samples[0]['status'] == 'down':
+        if not samples:
             continue
-        
+        # Cumulative counters: use last sample for totals
+        last = samples[-1]
         iface_stats = InterfaceStats(
             name=iface_name,
-            rx_pps_avg=round(mean(s['rx_pps'] for s in samples), 1),
-            tx_pps_avg=round(mean(s['tx_pps'] for s in samples), 1),
-            rx_bps_avg=round(mean(s['rx_bps'] for s in samples), 1),
-            tx_bps_avg=round(mean(s['tx_bps'] for s in samples), 1),
-            rx_packets_total=samples[-1]['rx_packets'],  # Last sample has cumulative
-            tx_packets_total=samples[-1]['tx_packets'],
+            rx_packets_total=last['rx_packets'],
+            tx_packets_total=last['tx_packets'],
         )
-        
-        if iface_name == 'vni-0/3':
+        if iface_name == 'vlan200':
             dut_stats.lan_interface = iface_stats
-        elif iface_name == 'vni-0/4':
+        elif iface_name == 'ether1':
             dut_stats.wan_interface = iface_stats
-    
+
     return dut_stats
 
 

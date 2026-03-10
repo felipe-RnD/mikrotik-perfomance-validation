@@ -1,0 +1,11 @@
+- name: Wrapper to run T-Rex load asynchronously
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - ../../inventory/group_vars/all.yml
+    - ../../inventory/group_vars/trex_server.yml
+  tasks:
+    - name: Include start_test task from role
+      ansible.builtin.include_role:
+        name: 02_trex_control
+        tasks_from: start_test.yml

@@ -20,10 +20,10 @@ platform_interface_speed_gb: 1  # 1GbE interfaces
 # -----------------------------------------------------------------
 
 dut_interface_map:
-  mgmt: "eth4"              # Management interface
-  lan_trex: "eth3.200"   # K6 and T-Rex LAN interface with VLAN 200
-  lan_k6: "eth3.203"
-  wan_trunk: "eth1"         # WAN trunk interface (VLANs 100-113)
+  mgmt: "ether4"            # Management interface
+  lan_trex: "vlan200"       # K6 and T-Rex LAN interface (VLAN 200)
+  lan_k6: "vlan203"
+  wan_trunk: "ether1"       # WAN trunk interface (VLANs 100-113)
 
 # -----------------------------------------------------------------
 # Expected Performance Ceilings (for reporting)

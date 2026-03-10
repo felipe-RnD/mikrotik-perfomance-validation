@@ -24,8 +24,8 @@
 
     - name: S3 PRE-TASK - Set default path counts if undefined
       ansible.builtin.set_fact:
-        test_path_counts: [1, 2, 4, 8, 14]
-      when: test_path_counts is not defined
+        test_path_count: [1]
+      when: test_path_count is not defined
 
     - name: S3 - Gather facts for timestamps
       ansible.builtin.setup:
@@ -245,7 +245,7 @@
         msg: "{{ item.path_count }}     {{ item.max_rate_gbps }}      {{ item.background_load_gbps }}     {{ item.trex_loss_pct | default(0) | round(2) }}%   {{ item.http_p95_ms | default(0) | round(1) }}ms    {{ item.db_p95_ms | default(0) | round(1) }}ms   {{ item.cpu_avg | default(0) | round(1) }}%   {{ 'PASS' if item.pass else 'FAIL' }}"
       loop: "{{ s03_summary.scaling_analysis }}"
       loop_control:
-        label: "{{ item.path_count }} paths"
+        label: "{{ item.path_count }} path"
 
     - name: S3 - Display results location
       ansible.builtin.debug:

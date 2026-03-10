@@ -1,5 +1,5 @@
 - name: Monitoring Wrapper
-  hosts: dut
+  hosts: localhost
   gather_facts: no
   tasks:
     - name: Run monitoring loop

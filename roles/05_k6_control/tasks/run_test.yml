@@ -1,0 +1,56 @@
+- name: "K6 - Ensure scripts directory exists"
+  ansible.builtin.file:
+    path: "{{ k6_scripts_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: "{{ groups['k6_server'][0] }}"
+
+- name: "K6 - Ensure results directory exists"
+  ansible.builtin.file:
+    path: "{{ k6_results_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: "{{ groups['k6_server'][0] }}"
+
+- name: "K6 - Copy test script to K6 server"
+  ansible.builtin.copy:
+    src: ../files/k6_transaction_test.js
+    dest: "{{ k6_scripts_dir }}/k6_transaction_test.js"
+    mode: '0644'
+  delegate_to: "{{ groups['k6_server'][0] }}"
+
+- name: "K6 - Define remote temp output file"
+  ansible.builtin.set_fact:
+    # Save to /opt/k6/results/filename.json on the remote host
+    remote_results_file: "{{ k6_results_dir }}/{{ results_file_name | basename }}"
+
+- name: "K6 - Run Transaction Test ({{ k6_test_profile }})"
+  ansible.builtin.shell: |
+    {{ k6_binary_path }} run \
+      -e VUS={{ k6_vus }} \
+      -e DURATION={{ k6_duration }} \
+      -e TARGET_ENDPOINT="{{ k6_target_url }}" \
+      {{ k6_scripts_dir }}/k6_transaction_test.js \
+      --summary-export {{ remote_results_file }}
+  vars:
+    k6_vus: "{{ k6_vus | default(10) }}"
+    k6_duration: "{{ k6_duration | default('30s') }}"
+    k6_target_url: "{{ k6_target_url | default('http://10.0.0.2/') }}"
+    k6_test_profile: "{{ k6_test_profile | default('standard_test') }}"
+  delegate_to: "{{ groups['k6_server'][0] }}"
+  register: k6_run_result
+  # Important: K6 returns non-zero if thresholds fail (e.g. 100% error rate).
+  # We want to capture the result file regardless of success/failure.
+  ignore_errors: yes
+
+- name: "K6 - Fetch results to Controller"
+  ansible.builtin.fetch:
+    src: "{{ remote_results_file }}"
+    dest: "{{ results_file_name }}"
+    flat: yes
+  delegate_to: "{{ groups['k6_server'][0] }}"
+
+- name: "K6 - DEBUG Failure"
+  ansible.builtin.debug:
+    msg: "K6 Thresholds failed. Check connectivity to {{ k6_target_url }}."
+  when: k6_run_result.rc != 0

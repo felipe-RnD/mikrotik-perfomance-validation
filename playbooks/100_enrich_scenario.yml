@@ -1,0 +1,37 @@
+# =============================================================================
+# Enrich results for a single scenario directory
+# =============================================================================
+# Called by 100_generate_master_report.yml for each scenario directory
+# Runs the Python parsers to generate s0X_summary.json files if missing
+#
+# Input variable: enrich_item
+#   - scenario: s02, s03, s04, s05
+#   - parser: parser script name
+#   - dir: full path to scenario directory
+#   - args: additional command line arguments (thresholds)
+# =============================================================================
+
+- name: "Check if summary exists for {{ enrich_item.dir | basename }}"
+  ansible.builtin.stat:
+    path: "{{ enrich_item.dir }}/{{ enrich_item.scenario }}_summary.json"
+  register: summary_stat
+  when: enrich_item.dir | length > 0
+
+- name: "Run {{ enrich_item.parser }} for {{ enrich_item.dir | basename }}"
+  ansible.builtin.command:
+    cmd: "python3 {{ scripts_dir }}/{{ enrich_item.parser }} {{ enrich_item.dir }} {{ enrich_item.args | default('') }}"
+    chdir: "{{ playbook_dir }}/.."
+  when:
+    - enrich_item.dir | length > 0
+    - not summary_stat.stat.exists | default(true)
+  ignore_errors: yes
+  delegate_to: localhost
+  become: false
+  register: parser_result
+
+- name: "Display parser output for {{ enrich_item.dir | basename }}"
+  ansible.builtin.debug:
+    msg: "{{ parser_result.stdout_lines | default(['Parser skipped or not needed']) }}"
+  when: 
+    - parser_result is defined
+    - parser_result.stdout_lines is defined

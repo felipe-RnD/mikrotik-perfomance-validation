@@ -159,10 +159,11 @@
           {
             "scenario": "04_session_scalability",
             "test_mode": "{{ test_mode }}",
-            "wan_paths_enabled": 14,
+            "wan_paths_enabled": 1,
             "test_duration_sec": {{ session_test_duration_sec }},
             "multiplier": {{ session_test_rate_mult }},
             "target_cps": {{ target_cps_val }},
+            "monitor_start_delay_sec": 28,
             "dut_monitoring_log": "s4_session_dut_monitor.log",
             "trex_profile": "session_ramp (ASTF)",
             "timestamp": "{{ ansible_date_time.iso8601 }}"

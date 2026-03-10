@@ -24,7 +24,7 @@ ansible_become_method: none
 # -----------------------------------------------------------------
 # Define which physical interfaces are used for WAN and LAN
 dut_interface_map:
-  wan_trunk: "ether1"  # CHANGEME - Adjust to your DUT's WAN trunk interface
+  wan_trunk: "ether1"  # WAN trunk interface
 
 # -----------------------------------------------------------------
 # Performance Test Parameters

@@ -4,7 +4,10 @@
       - monitor_duration_sec is defined
       - monitor_interval_sec is defined
       - monitor_output_file is defined
-    fail_msg: "Required variables: monitor_duration_sec, monitor_interval_sec, monitor_output_file"
+      - ansible_host is defined
+      - ansible_user is defined
+      - ansible_ssh_pass is defined
+    fail_msg: "Required variables: monitor_duration_sec, monitor_interval_sec, monitor_output_file, ansible_host, ansible_user, ansible_ssh_pass"
 
 - name: MONITOR - Calculate iterations
   ansible.builtin.set_fact:
@@ -12,7 +15,7 @@
 
 - name: MONITOR - Generate persistent Expect script (MikroTik)
   ansible.builtin.copy:
-    dest: "/tmp/persistent_monitor_{{ inventory_hostname }}.exp"
+    dest: "/tmp/persistent_monitor_dut.exp"
     mode: '0755'
     content: |
       #!/usr/bin/expect -f
@@ -20,18 +23,14 @@
       log_user 1
 
       # 1. Establish Connection (MANDATORY SPACE FIX)
-      spawn ssh -o StrictHostKeyChecking=no {{ ansible_user }}@{{ ansible_host }}
+      spawn ssh -o StrictHostKeyChecking=no -i ~/.ssh/lab_key {{ ansible_user }}@{{ ansible_host }}
       expect {
-        "password:" { send "{{ ansible_ssh_pass }}\r" }
+        "password:" { send "{{ ansible_ssh_pass }}\r"; exp_continue }
         "(yes/no)" { send "yes\r"; exp_continue }
+        " > " { }
+        timeout { puts "ERROR: SSH connection timed out"; exit 1 }
+        eof { puts "ERROR: SSH connection closed unexpectedly"; exit 1 }
       }
-
-      expect " > "
-      send "/console screen-256-colors disable\r"
-      expect " > "
-      send "/console set numbers=no\r"
-      expect " > "
-
       set max_iter {{ monitor_iterations }}
 
       # 2. Initial Delay (Avoid Test Ramp-up)
@@ -77,11 +76,21 @@
   delegate_to: localhost
   become: false
 
-- name: MONITOR - Execute persistent monitoring (Async)
+- name: MONITOR - Execute persistent monitoring
   ansible.builtin.shell: |
-    /tmp/persistent_monitor_{{ inventory_hostname }}.exp > {{ monitor_output_file }} 2>&1
-  async: "{{ monitor_duration_sec | int + 60 }}"
-  poll: 0
-  register: monitor_job
+    /tmp/persistent_monitor_dut.exp > {{ monitor_output_file }} 2>&1
+  register: monitor_result
   delegate_to: localhost
   become: false
+
+- name: MONITOR - Verify log file was created
+  ansible.builtin.stat:
+    path: "{{ monitor_output_file }}"
+  register: monitor_log_stat
+  delegate_to: localhost
+
+- name: MONITOR - Report monitoring status
+  ansible.builtin.debug:
+    msg: >-
+      Monitor log {{ 'created successfully' if monitor_log_stat.stat.exists and monitor_log_stat.stat.size > 0
+      else 'FAILED - check /tmp/persistent_monitor_dut.exp and SSH connectivity to ' + ansible_host }}

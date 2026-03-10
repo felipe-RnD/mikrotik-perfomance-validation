@@ -27,6 +27,7 @@
         path: "{{ test_mode_results_dir }}"
         state: directory
         mode: '0755'
+      become: false
 
     # -----------------------------------------------------------------------
     # Variable Loading Strategy (Robust & Prioritized)
